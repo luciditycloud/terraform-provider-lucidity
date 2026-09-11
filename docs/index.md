@@ -15,7 +15,7 @@ Interact with the Lucidity cloud storage optimization platform.
 terraform {
   required_providers {
     lucidity = {
-      source = "registry.terraform.io/Devaansh/lucidity"
+      source = "registry.terraform.io/luciditycloud/lucidity"
     }
   }
 }

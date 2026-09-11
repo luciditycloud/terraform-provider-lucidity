@@ -21,7 +21,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-log/tflog"
 
-	"github.com/Devaansh/terraform-provider-lucidity/internal/client"
+	"github.com/luciditycloud/terraform-provider-lucidity/internal/client"
 )
 
 const defaultMaxParallelRequests = 10

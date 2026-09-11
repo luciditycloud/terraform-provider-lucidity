@@ -8,7 +8,7 @@ import (
 
 	"github.com/hashicorp/terraform-plugin-framework/providerserver"
 
-	"github.com/Devaansh/terraform-provider-lucidity/internal/provider"
+	"github.com/luciditycloud/terraform-provider-lucidity/internal/provider"
 )
 
 // version is overridden at build time via -ldflags "-X main.version=..."
@@ -21,7 +21,7 @@ func main() {
 	flag.Parse()
 
 	opts := providerserver.ServeOpts{
-		Address: "registry.terraform.io/Devaansh/lucidity",
+		Address: "registry.terraform.io/luciditycloud/lucidity",
 		Debug:   debug,
 	}
 

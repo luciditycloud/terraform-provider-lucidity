@@ -1,7 +1,7 @@
 terraform {
   required_providers {
     lucidity = {
-      source = "registry.terraform.io/Devaansh/lucidity"
+      source = "registry.terraform.io/luciditycloud/lucidity"
     }
   }
 }

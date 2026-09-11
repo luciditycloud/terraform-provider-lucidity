@@ -13,7 +13,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
 	"github.com/hashicorp/terraform-plugin-go/tftypes"
 
-	"github.com/Devaansh/terraform-provider-lucidity/internal/client"
+	"github.com/luciditycloud/terraform-provider-lucidity/internal/client"
 )
 
 // This file drives tenantResource's actual Create/Read/Update/Delete Go

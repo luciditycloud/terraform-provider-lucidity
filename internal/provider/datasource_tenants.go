@@ -8,7 +8,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/datasource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 
-	"github.com/Devaansh/terraform-provider-lucidity/internal/client"
+	"github.com/luciditycloud/terraform-provider-lucidity/internal/client"
 )
 
 var (

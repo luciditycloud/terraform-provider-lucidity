@@ -69,7 +69,7 @@ _Author: Devaansh Goenka._
 
 - Rotated the release-signing GPG key; new signatures use the new key from
   this release onward.
-- Clarified in `README.md` that `Devaansh/lucidity` is the beta Registry
+- Clarified in `README.md` that `luciditycloud/lucidity` is the beta Registry
   namespace and `luciditycloud/lucidity` is the official-stable one.
 
 ## [0.1.2] - 2026-09-11
