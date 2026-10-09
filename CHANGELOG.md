@@ -55,9 +55,11 @@ once it reaches a stable release cadence.
   claim it is only a `for_each` collision; they explain it may be a tenant
   from an earlier failed/timed-out apply and give the `terraform import`
   command.
-- A 401 on an update that changes role/policy/external ID is reported as
-  "Lucidity rejected the update (401)" with trust-policy advice instead of a
-  bare expired-token message.
+- A 401 on an update that changes role/policy/external ID (or on onboard
+  with no cloud-account message) is reported with a checklist of every
+  possible cause (token, role name, trust policy, external ID, policy,
+  permissions boundary/SCP, account ID, IAM propagation) instead of a bare
+  expired-token message.
 
 - Clarified the `skip_cloud_permission_check` documentation in `README.md`
   to match the schema description: it skips the permission check only,

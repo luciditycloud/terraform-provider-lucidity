@@ -953,11 +953,31 @@ func handleOnboardError(diags *diag.Diagnostics, err error, accountID string) {
 		diags.AddError("Lucidity API error onboarding tenant", apiErr.Error())
 		return
 	}
+	var authErr client.AuthError
+	if errors.As(err, &authErr) {
+		diags.AddError(
+			"Lucidity rejected the onboard call (401)",
+			fmt.Sprintf("Lucidity answered 401 to onboarding cloud account %s and did not say why (%s).\n\n%s", accountID, err.Error(), unauthorizedChecklist),
+		)
+		return
+	}
 	diags.AddError("Unable to onboard Lucidity tenant", err.Error())
 }
 
-const updateValidationHint = "Lucidity re-validates by assuming your IAM role when the role name, policy name or external ID changes. " +
-	"Check that the role exists, and that its trust policy already allows Lucidity with the NEW external ID — rotate the trust policy first, then apply this change."
+// unauthorizedChecklist enumerates every known cause of a 401 on a call that
+// makes Lucidity assume the customer's IAM role. Lucidity's 401 body doesn't
+// say which one applies (and a plain bad-token 401 looks identical), so the
+// user gets the full list to work through instead of a guess.
+const unauthorizedChecklist = "Possible causes — please check each:\n" +
+	"  1. The refresh token is expired, revoked or belongs to a different Lucidity account (default lifetime 30 days; regenerate it in the dashboard). If other Lucidity calls in this run succeeded, this is unlikely.\n" +
+	"  2. The IAM role named in aws_iam_role_name does not exist in the target account, or the name is misspelled (give the name only, not the ARN).\n" +
+	"  3. The role's trust policy does not allow Lucidity's principal to assume it.\n" +
+	"  4. The trust policy's sts:ExternalId condition does not match aws_iam_external_id. When rotating the external ID, update the trust policy FIRST, then apply the new value here.\n" +
+	"  5. The role is missing the policy named in aws_iam_policy_name, or that policy lacks permissions Lucidity needs.\n" +
+	"  6. A permissions boundary or service control policy (SCP) in the account blocks the role from being assumed or used.\n" +
+	"  7. The cloud_provider_account_id is not the account that owns the role.\n" +
+	"  8. A recent IAM change has not propagated yet (can take a minute or more) — wait and re-apply.\n" +
+	"The requestId in the error, if any, helps Lucidity support look it up (support@lucidity.cloud)."
 
 // validatesCloudAccount is true when the PATCH carried a field Lucidity
 // re-validates via AssumeRole (role/policy name, external ID).
@@ -970,11 +990,7 @@ func handleUpdateError(diags *diag.Diagnostics, err error, accountID string, val
 	if validatesCloudAccount && errors.As(err, &authErr) {
 		diags.AddError(
 			"Lucidity rejected the update (401)",
-			fmt.Sprintf(
-				"Lucidity answered 401 to the update for cloud account %s. This is either a rejected refresh token, or Lucidity failing to validate the cloud account after a role/policy/external-ID change. "+
-					"If other Lucidity calls in this run succeeded, it is almost certainly the latter. %s",
-				accountID, updateValidationHint,
-			),
+			fmt.Sprintf("Lucidity answered 401 to the update for cloud account %s and did not say why.\n\n%s", accountID, unauthorizedChecklist),
 		)
 		return
 	}
@@ -991,7 +1007,7 @@ func handleUpdateError(diags *diag.Diagnostics, err error, accountID string, val
 			if strings.Contains(strings.ToLower(apiErr.Message), "cloud account could not be validated") {
 				diags.AddError(
 					"Cloud account could not be validated",
-					fmt.Sprintf("Lucidity could not validate cloud account %s (requestId=%s): %s. %s", accountID, apiErr.RequestID, apiErr.Message, updateValidationHint),
+					fmt.Sprintf("Lucidity could not validate cloud account %s (requestId=%s): %s.\n\n%s", accountID, apiErr.RequestID, apiErr.Message, unauthorizedChecklist),
 				)
 				return
 			}

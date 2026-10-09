@@ -797,8 +797,13 @@ func TestLifecycle_ImportedTenantWithNullRemoteExternalIDIsBackfilledByUpdate(t 
 func TestHandleUpdateError_Ambiguous401(t *testing.T) {
 	var d diag.Diagnostics
 	handleUpdateError(&d, client.AuthError{}, "123456789012", true)
-	if len(d) != 1 || d[0].Summary() != "Lucidity rejected the update (401)" || !strings.Contains(d[0].Detail(), "trust policy") {
-		t.Fatalf("expected the dual-cause 401 diagnostic with trust-policy advice, got %+v", d)
+	if len(d) != 1 || d[0].Summary() != "Lucidity rejected the update (401)" {
+		t.Fatalf("expected the 401 checklist diagnostic, got %+v", d)
+	}
+	for _, want := range []string{"refresh token", "does not exist", "trust policy", "sts:ExternalId", "permissions boundary", "propagated"} {
+		if !strings.Contains(d[0].Detail(), want) {
+			t.Errorf("401 checklist missing %q: %s", want, d[0].Detail())
+		}
 	}
 	var d2 diag.Diagnostics
 	handleUpdateError(&d2, client.AuthError{}, "123456789012", false)

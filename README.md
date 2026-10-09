@@ -365,9 +365,14 @@ normal update on the next `apply`.
   only — it does **not** skip Lucidity's baseline cloud-account-reachability
   validation, which still runs regardless of this flag. An unreachable or
   invalid cloud account fails onboarding either way.
-- Updating `aws_iam_role_name`/`aws_iam_policy_name` doesn't re-validate that
-  the role/policy actually exists — a typo won't surface until something
-  needs it.
+- Changing `aws_iam_role_name` or `aws_iam_external_id` is re-validated by
+  Lucidity (it assumes the role), so a typo or a trust policy that wasn't
+  updated first fails the apply. `aws_iam_policy_name` and the display name
+  are not independently verified.
+- A 401 from Lucidity on those updates doesn't say which check failed, so the
+  error lists every possible cause (token, role name, trust policy, external
+  ID, policy, permissions boundary/SCP, account ID, IAM propagation) to work
+  through.
 
 Full test evidence: [docs/qa-testing/account-management.md](docs/qa-testing/account-management.md).
 Full schema reference: [docs/resources/tenant.md](docs/resources/tenant.md), [docs/data-sources/tenants.md](docs/data-sources/tenants.md).
@@ -381,8 +386,6 @@ provider's behavior will be updated once each ships. Should be backwards compati
 
 | Ticket | Improvement |
 |---|---|
-| CSEN-3811 | Allow rotating an existing tenant's AWS IAM external ID without deboarding and re-onboarding. |
-| CSEN-3813 | Provide a secure way to verify the configured AWS IAM external ID without exposing the raw value. |
 | CSEN-3814 | Support updating and reading `aws_org_root_id` after onboarding. |
 | CSEN-3815 | Support updating and reading `lucidity_product_list` throughout the tenant lifecycle. |
 | CSEN-3816 | Return non-sensitive AWS, Azure, and eventually GCP authentication fields from the Tenant List API. |
@@ -390,6 +393,13 @@ provider's behavior will be updated once each ships. Should be backwards compati
 | CSEN-3818 | Include the associated Dashboard account identity in API authentication responses. |
 | CSEN-3819 | Return distinct error codes for different cloud-account onboarding validation failures. |
 | CSEN-3821 | Apply onboarding-style IAM role and policy validation to tenant updates. |
+
+### Shipped
+
+| Ticket | Improvement | Provider behavior |
+|---|---|---|
+| CSEN-3811 | Allow rotating an existing tenant's AWS IAM external ID without deboarding and re-onboarding. | `aws_iam_external_id` is updatable in place (update the IAM trust policy first). |
+| CSEN-3813 | Provide a way to verify the configured AWS IAM external ID. | List returns `externalId`: `terraform import` recovers it and drift is detected on refresh. |
 
 
 ## Recommended local development setup
