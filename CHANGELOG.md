@@ -9,6 +9,10 @@ once it reaches a stable release cadence.
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-10-10
+
+_Author: Devaansh Goenka._
+
 ### Added
 
 - `terraform import` now recovers `aws_iam_external_id`: Lucidity's List
@@ -67,7 +71,6 @@ once it reaches a stable release cadence.
   possible cause (token, role name, trust policy, external ID, policy,
   permissions boundary/SCP, account ID, IAM propagation) instead of a bare
   expired-token message.
-
 - Clarified the `skip_cloud_permission_check` documentation in `README.md`
   to match the schema description: it skips the permission check only,
   never Lucidity's baseline cloud-account-reachability validation.
