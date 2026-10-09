@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 )
 
@@ -141,7 +142,31 @@ func (c *Client) ListTenants(ctx context.Context) ([]TenantListItem, error) {
 	if err := c.Do(ctx, http.MethodGet, tenantsPath, nil, &out); err != nil {
 		return nil, err
 	}
+	// totalCount counts every tenant under the account (INACTIVE included),
+	// so it is only meaningful against this same response, never against
+	// anything local. A larger count than returned means the list was cut
+	// short (pagination), and any "not found" derived from it — Read removing
+	// state, Create's duplicate pre-check, the 5xx recovery — would be
+	// unreliable, so fail loudly instead. A missing/zero or smaller count
+	// (older backend, stale count) is not evidence of truncation.
+	if out.Meta.TotalCount > len(out.Tenants) {
+		return nil, &TruncatedListError{Returned: len(out.Tenants), Total: out.Meta.TotalCount}
+	}
 	return out.Tenants, nil
+}
+
+// TruncatedListError means ListTenants returned fewer tenants than the API
+// says exist. No page parameter is documented yet, so the provider cannot
+// fetch the rest.
+type TruncatedListError struct {
+	Returned, Total int
+}
+
+func (e *TruncatedListError) Error() string {
+	return fmt.Sprintf(
+		"lucidity returned %d of %d tenants (the list is truncated, likely paginated); the provider cannot safely tell whether a tenant exists, so it stops rather than guess. Report this to the provider maintainers or Lucidity support — pagination support is needed",
+		e.Returned, e.Total,
+	)
 }
 
 // FindTenant returns the list entry matching provider+accountID, and whether

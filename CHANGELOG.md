@@ -46,6 +46,13 @@ once it reaches a stable release cadence.
 
 ### Changed
 
+- `ListTenants` now errors with `TruncatedListError` when `meta.totalCount`
+  exceeds the number of tenants returned (a paginated/truncated list), instead
+  of silently treating a missing tenant as "not found" — which could remove a
+  real tenant from state or let a duplicate onboard through. The count is only
+  compared against the same response (it includes INACTIVE tenants, so it
+  never matches local state); a missing, zero or smaller count is ignored.
+
 - The onboard POST is no longer auto-retried on 5xx (`Client.DoNoRetry5xx`);
   all other calls keep the existing backoff retry. Transport failures are now
   a typed `client.TransportError`, and `client.IsOutcomeUnknown` classifies

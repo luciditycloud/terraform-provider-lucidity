@@ -407,3 +407,44 @@ func TestUpdateTenant_SendsExternalID(t *testing.T) {
 		t.Fatalf("UpdateTenant: %v", err)
 	}
 }
+
+func TestListTenants_TotalCountGuard(t *testing.T) {
+	cases := []struct {
+		name      string
+		total     int
+		wantTrunc bool
+	}{
+		{"matches returned", 2, false},
+		{"larger than returned: truncated", 5, true},
+		{"missing/zero (older backend)", 0, false},
+		{"smaller than returned (stale count)", 1, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mux := http.NewServeMux()
+			mux.HandleFunc(tenantsPath, func(w http.ResponseWriter, r *http.Request) {
+				writeEnvelope(w, http.StatusOK, true, map[string]any{
+					"tenants": []map[string]any{
+						{"tenantId": "a", "cloudProvider": "AWS", "cloudProviderAccountId": "1", "status": "ACTIVE"},
+						{"tenantId": "b", "cloudProvider": "AWS", "cloudProviderAccountId": "2", "status": "INACTIVE"},
+					},
+					"meta": map[string]any{"totalCount": tc.total},
+				}, nil, "req-l")
+			})
+			c, _ := newTenantTestClient(t, mux)
+
+			got, err := c.ListTenants(context.Background())
+			var te *TruncatedListError
+			if isTrunc := errors.As(err, &te); isTrunc != tc.wantTrunc {
+				t.Fatalf("truncated error = %v, want %v (err=%v)", isTrunc, tc.wantTrunc, err)
+			}
+			if tc.wantTrunc {
+				if te.Returned != 2 || te.Total != 5 || got != nil {
+					t.Fatalf("unexpected truncation result: %+v got=%v", te, got)
+				}
+			} else if err != nil || len(got) != 2 {
+				t.Fatalf("expected both tenants and no error, got %v / %v", got, err)
+			}
+		})
+	}
+}
