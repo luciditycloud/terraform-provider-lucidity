@@ -92,6 +92,16 @@ Phase 1 definition of done:
    - Parse standard envelope `{success, data, error{code,message}, requestId}`.
      All error diagnostics MUST include error.code, error.message, requestId.
    - Retry: 500s with exponential backoff; NEVER auto-retry 400s.
+     **Exception (2026-10-10): the onboard POST is never auto-retried on a
+     5xx** (`Client.DoNoRetry5xx`) — a 5xx doesn't prove the tenant wasn't
+     created, and a blind retry after a successful create surfaces a masking
+     409 (seen in the NYL-Prod incident). `client.IsOutcomeUnknown(ctx, err)`
+     is true for 5xx and transport failures (`client.TransportError`:
+     timeouts/connection errors) unless the caller's ctx is done; Create()
+     then re-lists (`recoverUnknownOnboard`): ACTIVE → adopt + sync display
+     name/external ID via PATCH (+ warning); INACTIVE → "already exists and is
+     in inactive state, contact support"; not found → error with recommended
+     actions. Deliberate deviation from the API doc's "5xx are safe to resend".
      **CONFLICT confirmed (2026-09-06): "Already a tenant exists with the
      provided details."** Not transient — never retry it (already the
      behavior, unchanged). This is a real, actionable business-logic state
@@ -285,7 +295,8 @@ Created`. Deboard endpoint: `PUT /external/client/api/v1/tenants/deboard` →
   philosophy. Request field is `productList`; the onboard *response* field
   is `products` (different name) — don't conflate the two in Go struct tags.
   Not accepted by Update for any provider, and never returned by List, so it
-  can't be recovered by import either.
+  can't be recovered by import either (assumed to match config after import,
+  see "Import").
 - `aws_iam_external_id` (in `cloud_entity_information`, **required for AWS
   onboarding, `Optional` at the schema level** — enforced via `ValidateConfig`
   instead, so AZURE/GCP resources aren't forced to set it): a value the
@@ -295,16 +306,13 @@ Created`. Deboard endpoint: `PUT /external/client/api/v1/tenants/deboard` →
   field server-side and a malformed value would otherwise only surface much
   later, ambiguously, as an AssumeRole trust-policy mismatch) and places it
   in the target IAM role's trust policy; Lucidity sends it
-  on every `AssumeRole`. **Write-only on the real API** — never returned by
-  onboard, update, or list responses, and update silently keeps the
-  onboarding-time value forever regardless of what's sent (see "Update
-  APIs"). RequiresReplace: since this provider can never read back or verify
-  the true server-side value, any config change is modeled as a full
-  destroy+re-onboard rather than a silent no-op, which would risk state and
-  the real IAM trust policy quietly disagreeing. **Known import gap:**
-  `terraform import` cannot recover this value (nor can any Read); the
-  practitioner must supply the real one matching the account's trust policy,
-  or the very next apply forces a replace.
+  on every `AssumeRole`. **Updated 2026-10-10: no longer write-only** —
+List returns it (`externalId`, string|null) and PATCH accepts it, so it is
+read on import/refresh (drift detection) and updatable in place; the old
+RequiresReplace is gone. Rotation order is the user's job: update the AWS
+trust policy first, then Terraform (Lucidity re-validates via AssumeRole).
+Create/Update keep the planned value in state; only `Read` adopts the remote
+value (see "Import").
 - `aws_org_root_id` (re-added 2026-09-07, **optional**, top-level attribute —
   sibling of `lucidity_dashboard_display_name`/`lucidity_product_list`, NOT nested inside
   `cloud_entity_information`, per the maintainer's explicit placement in the
@@ -332,7 +340,7 @@ Created`. Deboard endpoint: `PUT /external/client/api/v1/tenants/deboard` →
   future release of this provider may add support for modifying it in
   place**, if and when Lucidity ever documents a path for it.
 - Immutable (RequiresReplace, gated by protection below): `cloud_provider`,
-  `cloud_provider_account_id`, `aws_iam_external_id` (see above), `lucidity_product_list`
+  `cloud_provider_account_id`, `lucidity_product_list`
   (not listed as updatable in the real Update API's field table either —
   see "Update APIs").
 - **Updates go through the real `PATCH /tenants` endpoint (see "Update
@@ -408,8 +416,11 @@ gone from current docs entirely — treated as superseded, not implemented.
   least one provider auth field, or the request is rejected.
 - Cloud `authInfo` is **merged** — only the provider fields you send are
   overwritten; the rest of the existing `authInfo` is preserved.
-- `externalId` can **never** be changed via update — the value from
-  onboarding is kept forever regardless of what's sent.
+- `externalId` **can be changed via update** (API change, confirmed
+  2026-10-10; previously ignored forever) and is returned by List (string or
+  null; key absent on older backends — `TenantListItem.ExternalIDReported`
+  tells them apart). Lucidity re-validates by AssumeRole, so the AWS trust
+  policy must be updated first.
 - Per-provider updatable fields: **AWS** — `awsIAMRoleName`,
   `awsIAMPolicyName` (ARN rebuilt, existing `externalId` preserved);
   **AZURE** — `azureServicePrincipalId`, `azureDirectoryId` (merged into
@@ -441,16 +452,17 @@ and error code, different meaning, only distinguishable by message text.
 Imported resources get lucidity_dashboard_account_delete_protection=true regardless of config
 until first apply.
 
-**Known gap, implemented as designed rather than hidden:** `aws_iam_external_id` and
-`lucidity_product_list` are never returned by List (write-only / not exposed at all),
-so import cannot populate them — the practitioner must write a matching
-resource block, and since both are RequiresReplace, a value that doesn't
-match reality forces a destroy+recreate on the next apply rather than
-drifting silently. `aws_iam_role_name`, `aws_iam_policy_name`, and
-`lucidity_dashboard_display_name` reconcile safely instead: since they're real updatable
-fields, a mismatch after import just triggers a normal `Update()` call on
-the next apply. `ImportState` emits a warning listing all of this at import
-time.
+**Updated 2026-10-10.** `aws_iam_external_id` is now returned by List, so
+`Read` recovers it on import (only when List reports a non-null value for an
+AWS tenant; null/absent leaves state alone) and it is updatable in place (no
+RequiresReplace). `lucidity_product_list` and `aws_org_root_id` are still not
+returned by List: per the maintainer, after import they are *assumed* to match
+config — null state never forces a replace (`RequiresReplaceIf` on the list)
+or errors (`ModifyPlan`'s org-root check); the config value is recorded on the
+next apply. A value already in state still behaves as before (replace / plan
+error). `aws_iam_role_name`, `aws_iam_policy_name`, and
+`lucidity_dashboard_display_name` reconcile via a normal `Update()` on the
+next apply. `ImportState` emits a warning describing all of this.
 
 ### Data source `lucidity_tenants`
 

@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -261,5 +263,147 @@ func TestDeboardTenant_NotFound(t *testing.T) {
 	var apiErr *APIError
 	if !errors.As(err, &apiErr) || apiErr.Code != "NOT_FOUND" {
 		t.Fatalf("got %v, want *APIError with code NOT_FOUND", err)
+	}
+}
+
+func TestOnboardTenant_DoesNotRetry5xx(t *testing.T) {
+	var posts int32
+	mux := http.NewServeMux()
+	mux.HandleFunc(tenantsOnboardPath, func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&posts, 1)
+		writeEnvelope(w, http.StatusInternalServerError, false, nil, &envelopeError{Code: "INTERNAL_ERROR", Message: "boom"}, "req-500")
+	})
+	c, _ := newTenantTestClient(t, mux)
+
+	_, err := c.OnboardTenant(context.Background(), OnboardTenantRequest{})
+	if err == nil {
+		t.Fatal("expected an error, got nil")
+	}
+	if got := atomic.LoadInt32(&posts); got != 1 {
+		t.Fatalf("expected exactly 1 onboard POST on a 5xx (no auto-retry), got %d", got)
+	}
+	if !IsOutcomeUnknown(context.Background(), err) {
+		t.Fatalf("a 5xx must be classified outcome-unknown, got: %v", err)
+	}
+}
+
+func TestOnboardTenant_StillRetries401AfterRefresh(t *testing.T) {
+	var posts int32
+	mux := http.NewServeMux()
+	mux.HandleFunc(tenantsOnboardPath, func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&posts, 1) == 1 {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		writeEnvelope(w, http.StatusCreated, true, OnboardedTenant{TenantID: "t"}, nil, "req-ok")
+	})
+	c, _ := newTenantTestClient(t, mux)
+
+	if _, err := c.OnboardTenant(context.Background(), OnboardTenantRequest{}); err != nil {
+		t.Fatalf("OnboardTenant: %v", err)
+	}
+	if got := atomic.LoadInt32(&posts); got != 2 {
+		t.Fatalf("expected 2 POSTs (401 then success after forced refresh), got %d", got)
+	}
+}
+
+func TestIsOutcomeUnknown(t *testing.T) {
+	ctx := context.Background()
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+
+	conn := &TransportError{Err: errors.New("connection reset by peer")}
+	cases := []struct {
+		name string
+		ctx  context.Context
+		err  error
+		want bool
+	}{
+		{"nil", ctx, nil, false},
+		{"5xx", ctx, &APIError{HTTPStatus: 503, Code: "X"}, true},
+		{"wrapped 5xx", ctx, fmt.Errorf("wrap: %w", &APIError{HTTPStatus: 500}), true},
+		{"4xx conflict", ctx, &APIError{HTTPStatus: 409, Code: "CONFLICT"}, false},
+		{"4xx validation", ctx, &APIError{HTTPStatus: 400, Code: "INVALID_REQUEST"}, false},
+		{"auth error", ctx, AuthError{}, false},
+		{"transport error", ctx, conn, true},
+		{"transport error but caller cancelled", cancelled, conn, false},
+		{"plain error", ctx, errors.New("encoding body"), false},
+	}
+	for _, tc := range cases {
+		if got := IsOutcomeUnknown(tc.ctx, tc.err); got != tc.want {
+			t.Errorf("%s: IsOutcomeUnknown = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestOnboardTenant_ConnectionDropIsOutcomeUnknown(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc(tenantsOnboardPath, func(w http.ResponseWriter, r *http.Request) {
+		// Hijack and close without writing a response: the request was
+		// received but the client never learns the outcome.
+		conn, _, _ := w.(http.Hijacker).Hijack()
+		_ = conn.Close()
+	})
+	c, _ := newTenantTestClient(t, mux)
+
+	_, err := c.OnboardTenant(context.Background(), OnboardTenantRequest{})
+	if err == nil {
+		t.Fatal("expected an error, got nil")
+	}
+	if !IsOutcomeUnknown(context.Background(), err) {
+		t.Fatalf("a dropped connection must be classified outcome-unknown, got: %v", err)
+	}
+}
+
+func TestListTenants_ExternalIDPresence(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc(tenantsPath, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"success":true,"data":{"tenants":[
+			{"tenantId":"a","cloudProvider":"AWS","cloudProviderAccountId":"1","externalId":"8f14e45f-ceea-4331-9f5e-111111111111"},
+			{"tenantId":"b","cloudProvider":"AWS","cloudProviderAccountId":"2","externalId":null},
+			{"tenantId":"c","cloudProvider":"AWS","cloudProviderAccountId":"3"}
+		],"meta":{"totalCount":3}}}`))
+	})
+	c, _ := newTenantTestClient(t, mux)
+
+	got, err := c.ListTenants(context.Background())
+	if err != nil {
+		t.Fatalf("ListTenants: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("got %d tenants, want 3", len(got))
+	}
+	if !got[0].ExternalIDReported || got[0].ExternalID == nil || *got[0].ExternalID != "8f14e45f-ceea-4331-9f5e-111111111111" {
+		t.Errorf("value case: got %+v", got[0])
+	}
+	if !got[1].ExternalIDReported || got[1].ExternalID != nil {
+		t.Errorf("explicit null case: want reported-but-nil, got %+v", got[1])
+	}
+	if got[2].ExternalIDReported || got[2].ExternalID != nil {
+		t.Errorf("absent key case (older backend): want not reported, got %+v", got[2])
+	}
+	if got[0].TenantID != "a" || got[2].CloudProviderAccountID != "3" {
+		t.Errorf("other fields must still decode, got %+v / %+v", got[0], got[2])
+	}
+}
+
+func TestUpdateTenant_SendsExternalID(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc(tenantsPath, func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if got := body["cloudEntityInformation"]["externalId"]; got != "new-ext" {
+			t.Errorf("expected externalId=new-ext in PATCH body, got %v", got)
+		}
+		writeEnvelope(w, http.StatusOK, true, UpdatedTenant{TenantID: "t"}, nil, "req-u")
+	})
+	c, _ := newTenantTestClient(t, mux)
+
+	_, err := c.UpdateTenant(context.Background(), UpdateTenantRequest{CloudEntityInformation: CloudEntityInformation{
+		CloudProvider: "AWS", CloudProviderAccountID: "1", ExternalID: "new-ext",
+	}})
+	if err != nil {
+		t.Fatalf("UpdateTenant: %v", err)
 	}
 }

@@ -303,9 +303,9 @@ can be onboarded through this provider today (see the support table above).
 | `aws_iam_role_name` / `aws_iam_policy_name` (AWS) | Yes |
 | `azure_service_principal_id` / `azure_directory_id` (Azure) | Yes |
 | `cloud_provider`, `cloud_provider_account_id` | No — different tenant, forces replace |
-| `aws_iam_external_id` | No — write-only on Lucidity's API, forces replace if changed |
-| `lucidity_product_list` | No — not supported by Lucidity's update API |
-| `aws_org_root_id` | No — no update mechanism exists yet; caught at `terraform plan` |
+| `aws_iam_external_id` | Yes — Lucidity returns and accepts it now. **Update your IAM role's trust policy first**, then change the value: Lucidity re-validates by assuming the role and rejects the update otherwise |
+| `lucidity_product_list` | No — not supported by Lucidity's update API; changing a value already in state forces replace |
+| `aws_org_root_id` | No — no update mechanism exists yet; changing a value already in state is caught at `terraform plan` |
 
 ### Deboarding an account (`terraform destroy`)
 
@@ -331,8 +331,33 @@ output "active_tenant_ids" {
 }
 ```
 
+### Importing an existing tenant
+
+```sh
+terraform import lucidity_tenant.<name> AWS/<account-id>
+```
+
+Write a resource block for the account first, then import. Import reads the
+tenant's `aws_iam_external_id` and display name from Lucidity, so they no
+longer need to be guessed; a mismatch with your config is reconciled in
+place on the next `apply`. `lucidity_product_list` and `aws_org_root_id` are
+not returned by Lucidity's List API yet, so after import they are *assumed*
+to match your config (recorded, never compared, never forcing a replace).
+`aws_iam_role_name` / `aws_iam_policy_name` are likewise reconciled by a
+normal update on the next `apply`.
+
 ### Known behavior worth knowing
 
+- **Onboard is never auto-retried on a 5xx, timeout or connection error.**
+  Such a failure doesn't show whether the tenant was created, and re-sending
+  a successful create only produces a misleading "already exists" conflict.
+  Instead the provider re-lists tenants and decides: if the tenant exists and
+  is ACTIVE it is adopted into state and any differing display name /
+  external ID is synced via the update API; if it is INACTIVE you get an
+  "already exists and is in inactive state — contact support" error; if it is
+  not found you get an error with recommended actions (wait and re-apply, or
+  check the dashboard and `terraform import`). An "already exists" error on a
+  later apply means the same thing: `terraform import` the account.
 - Onboard/update/deboard can take a while to show up in `lucidity_tenants` —
   a `terraform apply` will retry for up to 150s before erroring; a genuine
   success sometimes still needs a manual re-`apply` past that window.

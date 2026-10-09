@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 )
 
@@ -74,7 +75,11 @@ type OnboardedTenant struct {
 // AWS-only today: a non-AWS cloudProvider returns 400 INVALID_REQUEST.
 func (c *Client) OnboardTenant(ctx context.Context, req OnboardTenantRequest) (*OnboardedTenant, error) {
 	var out OnboardedTenant
-	if err := c.Do(ctx, http.MethodPost, tenantsOnboardPath, req, &out); err != nil {
+	// DoNoRetry5xx, not Do: a 5xx on the onboard POST doesn't prove the
+	// tenant wasn't created, and blindly re-sending it turns a
+	// successful-but-5xx create into a masking 409. The caller re-lists to
+	// find out what actually happened instead (see IsOutcomeUnknown).
+	if err := c.DoNoRetry5xx(ctx, http.MethodPost, tenantsOnboardPath, req, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -88,6 +93,36 @@ type TenantListItem struct {
 	CloudEntityName        string `json:"cloudEntityName"`
 	DisplayName            string `json:"displayName"`
 	Status                 string `json:"status"`
+
+	// ExternalID is the AWS IAM external ID Lucidity holds for the tenant
+	// (nil when the API reports null). ExternalIDReported distinguishes a
+	// backend that returns the key at all (true, even if null) from an older
+	// one that omits it entirely (false) — only the former means "remote has
+	// no external id"; the latter means "can't tell", and callers must not
+	// treat it as a mismatch.
+	ExternalID         *string `json:"externalId"`
+	ExternalIDReported bool    `json:"-"`
+}
+
+// UnmarshalJSON records whether the externalId key was present at all.
+func (t *TenantListItem) UnmarshalJSON(b []byte) error {
+	type plain TenantListItem
+	aux := struct {
+		*plain
+		ExternalID json.RawMessage `json:"externalId"`
+	}{plain: (*plain)(t)}
+	if err := json.Unmarshal(b, &aux); err != nil {
+		return err
+	}
+	t.ExternalID, t.ExternalIDReported = nil, len(aux.ExternalID) > 0
+	if t.ExternalIDReported && string(aux.ExternalID) != "null" {
+		var v string
+		if err := json.Unmarshal(aux.ExternalID, &v); err != nil {
+			return err
+		}
+		t.ExternalID = &v
+	}
+	return nil
 }
 
 type tenantListMeta struct {
@@ -126,8 +161,9 @@ func FindTenant(tenants []TenantListItem, cloudProvider, cloudProviderAccountID 
 // whichever fields are changing should be set; the rest must stay zero so
 // they're omitted and existing values are preserved (authInfo is merged
 // server-side). DisplayName and/or at least one provider auth field must be
-// set, or the request is rejected. ExternalID is never sent — it can never
-// be changed via update.
+// set, or the request is rejected. ExternalID (AWS) can be rotated via
+// update; rotate the AWS trust policy first, since Lucidity re-validates by
+// AssumeRole.
 type UpdateTenantRequest struct {
 	CloudEntityInformation CloudEntityInformation `json:"cloudEntityInformation"`
 	DisplayName            string                 `json:"displayName,omitempty"`

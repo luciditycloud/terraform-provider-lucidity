@@ -5,9 +5,12 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
@@ -36,6 +39,7 @@ type mockTenant struct {
 	Status                 string
 	AWSIAMRoleName         string
 	AWSIAMPolicyName       string
+	ExternalID             *string // nil = reported as JSON null by List
 }
 
 // mockLucidityServer is a minimal, stateful stand-in for the real Public
@@ -44,6 +48,19 @@ type mockTenant struct {
 type mockLucidityServer struct {
 	mu      sync.Mutex
 	tenants map[string]*mockTenant // keyed by cloudProviderAccountID
+
+	// omitExternalID makes List leave the externalId key out entirely,
+	// simulating an older backend.
+	omitExternalID bool
+	// onboardFault injects a failure into the onboard POST: "" = none;
+	// "500-created" = create then answer 500; "500-created-other" = create
+	// with someone else's display name / external ID, then answer 500;
+	// "500-inactive" = create as INACTIVE then answer 500; "500-lost" =
+	// answer 500 without creating; "drop-created" = create then close the
+	// connection without a response.
+	onboardFault string
+	onboardCalls int
+	patchCalls   []client.UpdateTenantRequest
 }
 
 func newMockLucidityServer(t *testing.T) (*httptest.Server, *mockLucidityServer) {
@@ -73,7 +90,23 @@ func newMockLucidityServer(t *testing.T) (*httptest.Server, *mockLucidityServer)
 			writeMockEnvelope(w, http.StatusConflict, false, nil, "CONFLICT", msg)
 			return
 		}
+		m.onboardCalls++
+		fault := m.onboardFault
+		if fault == "500-lost" {
+			writeMockEnvelope(w, http.StatusInternalServerError, false, nil, "INTERNAL_ERROR", "boom")
+			return
+		}
+		var extID *string
+		if v := req.CloudEntityInformation.ExternalID; v != "" {
+			extID = &v
+		}
+		if fault == "500-created-other" {
+			other := "99999999-9999-4999-8999-999999999999"
+			extID = &other
+			req.DisplayName = "someone-elses-name"
+		}
 		t := &mockTenant{
+			ExternalID:             extID,
 			TenantID:               "mock_" + accountID,
 			CloudProvider:          req.CloudEntityInformation.CloudProvider,
 			CloudProviderAccountID: accountID,
@@ -83,6 +116,18 @@ func newMockLucidityServer(t *testing.T) (*httptest.Server, *mockLucidityServer)
 			AWSIAMPolicyName:       req.CloudEntityInformation.AWSIAMPolicyName,
 		}
 		m.tenants[accountID] = t
+		if fault == "500-inactive" {
+			t.Status = client.TenantStatusInactive
+		}
+		switch fault {
+		case "500-created", "500-created-other", "500-inactive":
+			writeMockEnvelope(w, http.StatusInternalServerError, false, nil, "INTERNAL_ERROR", "boom")
+			return
+		case "drop-created":
+			conn, _, _ := w.(http.Hijacker).Hijack()
+			_ = conn.Close()
+			return
+		}
 		writeMockEnvelope(w, http.StatusCreated, true, client.OnboardedTenant{
 			TenantID:               t.TenantID,
 			CloudProvider:          t.CloudProvider,
@@ -98,16 +143,20 @@ func newMockLucidityServer(t *testing.T) (*httptest.Server, *mockLucidityServer)
 		defer m.mu.Unlock()
 		switch r.Method {
 		case http.MethodGet:
-			items := make([]client.TenantListItem, 0, len(m.tenants))
+			items := make([]map[string]any, 0, len(m.tenants))
 			for _, t := range m.tenants {
-				items = append(items, client.TenantListItem{
-					TenantID:               t.TenantID,
-					CloudProvider:          t.CloudProvider,
-					CloudProviderAccountID: t.CloudProviderAccountID,
-					CloudEntityName:        "mock-entity-" + t.CloudProviderAccountID,
-					DisplayName:            t.DisplayName,
-					Status:                 t.Status,
-				})
+				item := map[string]any{
+					"tenantId":               t.TenantID,
+					"cloudProvider":          t.CloudProvider,
+					"cloudProviderAccountId": t.CloudProviderAccountID,
+					"cloudEntityName":        "mock-entity-" + t.CloudProviderAccountID,
+					"displayName":            t.DisplayName,
+					"status":                 t.Status,
+				}
+				if !m.omitExternalID {
+					item["externalId"] = t.ExternalID // nil marshals to null
+				}
+				items = append(items, item)
 			}
 			writeMockEnvelope(w, http.StatusOK, true, map[string]any{
 				"tenants": items,
@@ -116,6 +165,7 @@ func newMockLucidityServer(t *testing.T) (*httptest.Server, *mockLucidityServer)
 		case http.MethodPatch:
 			var req client.UpdateTenantRequest
 			_ = json.NewDecoder(r.Body).Decode(&req)
+			m.patchCalls = append(m.patchCalls, req)
 			accountID := req.CloudEntityInformation.CloudProviderAccountID
 			existing, ok := m.tenants[accountID]
 			if !ok {
@@ -128,6 +178,9 @@ func newMockLucidityServer(t *testing.T) (*httptest.Server, *mockLucidityServer)
 			}
 			if req.DisplayName != "" {
 				existing.DisplayName = req.DisplayName
+			}
+			if v := req.CloudEntityInformation.ExternalID; v != "" {
+				existing.ExternalID = &v
 			}
 			if req.CloudEntityInformation.AWSIAMRoleName != "" {
 				existing.AWSIAMRoleName = req.CloudEntityInformation.AWSIAMRoleName
@@ -530,4 +583,363 @@ func TestLifecycle_ImportState(t *testing.T) {
 			t.Fatal("expected an error diagnostic for a malformed import ID, got none")
 		}
 	})
+}
+
+// --- external ID read/update + import ------------------------------------
+
+const (
+	extIDA = "8f14e45f-ceea-4331-9f5e-111111111111" // matches tenantFullValue's default
+	extIDB = "00000000-0000-4000-8000-000000000000"
+)
+
+func ptr(s string) *string { return &s }
+
+// fastPolling shrinks refreshFromList's retry window so the not-found /
+// stale paths finish instantly.
+func fastPolling(t *testing.T) {
+	t.Helper()
+	oldN, oldD := refreshFromListRetries, refreshFromListDelay
+	refreshFromListRetries, refreshFromListDelay = 3, time.Millisecond
+	t.Cleanup(func() { refreshFromListRetries, refreshFromListDelay = oldN, oldD })
+}
+
+func newLifecycleResource(t *testing.T) (*tenantResource, *mockLucidityServer, *client.Client) {
+	t.Helper()
+	srv, mock := newMockLucidityServer(t)
+	c := client.NewClient(srv.URL, "test-token", client.WithHTTPClient(srv.Client()))
+	return &tenantResource{client: c}, mock, c
+}
+
+func runRead(t *testing.T, r *tenantResource, prior tftypes.Value) (*resource.ReadResponse, tenantResourceModel) {
+	t.Helper()
+	sch := tenantSchema(t)
+	ctx := context.Background()
+	resp := &resource.ReadResponse{State: tfsdk.State{Schema: sch}}
+	r.Read(ctx, resource.ReadRequest{State: tfsdk.State{Raw: prior, Schema: sch}}, resp)
+	var m tenantResourceModel
+	if !resp.State.Raw.IsNull() {
+		resp.State.Get(ctx, &m)
+	}
+	return resp, m
+}
+
+// TestLifecycle_ImportThenReadRecoversExternalID is the headline behavior:
+// import seeds only provider/account, and the very next Read pulls the
+// external ID from List.
+func TestLifecycle_ImportThenReadRecoversExternalID(t *testing.T) {
+	r, mock, _ := newLifecycleResource(t)
+	sch := tenantSchema(t)
+	ctx := context.Background()
+	mock.tenants["555555555555"] = &mockTenant{
+		TenantID: "t5", CloudProvider: "AWS", CloudProviderAccountID: "555555555555",
+		DisplayName: "imported", Status: client.TenantStatusActive, ExternalID: ptr(extIDA),
+	}
+
+	imp := &resource.ImportStateResponse{State: tfsdk.State{Schema: sch, Raw: tftypes.NewValue(sch.Type().TerraformType(ctx), nil)}}
+	r.ImportState(ctx, resource.ImportStateRequest{ID: "AWS/555555555555"}, imp)
+	if imp.Diagnostics.HasError() {
+		t.Fatalf("ImportState: %+v", imp.Diagnostics)
+	}
+
+	readResp, m := runRead(t, r, imp.State.Raw)
+	if readResp.Diagnostics.HasError() {
+		t.Fatalf("Read after import: %+v", readResp.Diagnostics)
+	}
+	if got := m.CloudEntityInformation.ExternalID.ValueString(); got != extIDA {
+		t.Fatalf("import must recover aws_iam_external_id from List, got %q", got)
+	}
+	if m.DisplayName.ValueString() != "imported" || m.Status.ValueString() != client.TenantStatusActive {
+		t.Fatalf("unexpected imported state: %+v", m)
+	}
+	if !m.AccountDeleteProtection.ValueBool() {
+		t.Fatal("imported resource must keep delete protection on")
+	}
+}
+
+func TestLifecycle_ReadExternalIDDriftAndBackcompat(t *testing.T) {
+	const acct = "123456789012"
+	prior := func() tftypes.Value {
+		return lifecycleValue(nil, map[string]tftypes.Value{"cloud_provider_account_id": strVal(acct)})
+	}
+	seed := func(mock *mockLucidityServer, ext *string) {
+		mock.tenants[acct] = &mockTenant{TenantID: "t", CloudProvider: "AWS", CloudProviderAccountID: acct,
+			DisplayName: "non-prod", Status: client.TenantStatusActive, ExternalID: ext}
+	}
+
+	t.Run("remote differs: drift surfaces in state", func(t *testing.T) {
+		r, mock, _ := newLifecycleResource(t)
+		seed(mock, ptr(extIDB))
+		_, m := runRead(t, r, prior())
+		if got := m.CloudEntityInformation.ExternalID.ValueString(); got != extIDB {
+			t.Fatalf("want drifted remote value %q in state, got %q", extIDB, got)
+		}
+	})
+	t.Run("remote differs only by case: keep configured casing", func(t *testing.T) {
+		r, mock, _ := newLifecycleResource(t)
+		seed(mock, ptr(strings.ToUpper(extIDA)))
+		_, m := runRead(t, r, prior())
+		if got := m.CloudEntityInformation.ExternalID.ValueString(); got != extIDA {
+			t.Fatalf("case-only difference must not be reported as drift, got %q", got)
+		}
+	})
+	t.Run("remote null: state untouched", func(t *testing.T) {
+		r, mock, _ := newLifecycleResource(t)
+		seed(mock, nil)
+		_, m := runRead(t, r, prior())
+		if got := m.CloudEntityInformation.ExternalID.ValueString(); got != extIDA {
+			t.Fatalf("null remote externalId must not wipe state, got %q", got)
+		}
+	})
+	t.Run("older backend omits the key: state untouched", func(t *testing.T) {
+		r, mock, _ := newLifecycleResource(t)
+		mock.omitExternalID = true
+		seed(mock, nil)
+		_, m := runRead(t, r, prior())
+		if got := m.CloudEntityInformation.ExternalID.ValueString(); got != extIDA {
+			t.Fatalf("absent externalId key must not wipe state, got %q", got)
+		}
+	})
+	t.Run("azure never adopts an external id", func(t *testing.T) {
+		r, mock, _ := newLifecycleResource(t)
+		mock.tenants["sub-1"] = &mockTenant{TenantID: "t", CloudProvider: "AZURE", CloudProviderAccountID: "sub-1",
+			DisplayName: "az", Status: client.TenantStatusActive, ExternalID: ptr(extIDB)}
+		az := lifecycleValue(nil, map[string]tftypes.Value{
+			"cloud_provider": strVal("AZURE"), "cloud_provider_account_id": strVal("sub-1"),
+			"aws_iam_external_id": tftypes.NewValue(tftypes.String, nil),
+		})
+		_, m := runRead(t, r, az)
+		if !m.CloudEntityInformation.ExternalID.IsNull() {
+			t.Fatalf("AZURE state must keep a null aws_iam_external_id, got %q", m.CloudEntityInformation.ExternalID.ValueString())
+		}
+	})
+}
+
+func runUpdate(t *testing.T, r *tenantResource, prior, plan tftypes.Value) (*resource.UpdateResponse, tenantResourceModel) {
+	t.Helper()
+	sch := tenantSchema(t)
+	ctx := context.Background()
+	resp := &resource.UpdateResponse{State: tfsdk.State{Schema: sch}}
+	r.Update(ctx, resource.UpdateRequest{
+		Plan:  tfsdk.Plan{Raw: plan, Schema: sch},
+		State: tfsdk.State{Raw: prior, Schema: sch},
+	}, resp)
+	var m tenantResourceModel
+	if !resp.Diagnostics.HasError() {
+		resp.State.Get(ctx, &m)
+	}
+	return resp, m
+}
+
+func TestLifecycle_UpdateRotatesExternalIDInPlace(t *testing.T) {
+	fastPolling(t)
+	r, mock, _ := newLifecycleResource(t)
+	const acct = "123456789012"
+	mock.tenants[acct] = &mockTenant{TenantID: "t", CloudProvider: "AWS", CloudProviderAccountID: acct,
+		DisplayName: "non-prod", Status: client.TenantStatusActive, ExternalID: ptr(extIDA)}
+	cei := map[string]tftypes.Value{"cloud_provider_account_id": strVal(acct)}
+	prior := lifecycleValue(nil, cei)
+	plan := lifecycleValue(nil, map[string]tftypes.Value{"cloud_provider_account_id": strVal(acct), "aws_iam_external_id": strVal(extIDB)})
+
+	resp, m := runUpdate(t, r, prior, plan)
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("Update: %+v", resp.Diagnostics)
+	}
+	if len(mock.patchCalls) != 1 || mock.patchCalls[0].CloudEntityInformation.ExternalID != extIDB {
+		t.Fatalf("expected exactly one PATCH carrying the new external ID, got %+v", mock.patchCalls)
+	}
+	if *mock.tenants[acct].ExternalID != extIDB || m.CloudEntityInformation.ExternalID.ValueString() != extIDB {
+		t.Fatalf("remote and state must both hold the new external ID: remote=%v state=%q", *mock.tenants[acct].ExternalID, m.CloudEntityInformation.ExternalID.ValueString())
+	}
+}
+
+// A display-name-only update must not send the external ID, and must not be
+// held up by a tenant whose remote externalId is null (onboarded before
+// Lucidity stored it).
+func TestLifecycle_UpdateDisplayNameDoesNotTouchExternalID(t *testing.T) {
+	fastPolling(t)
+	r, mock, _ := newLifecycleResource(t)
+	const acct = "123456789012"
+	mock.tenants[acct] = &mockTenant{TenantID: "t", CloudProvider: "AWS", CloudProviderAccountID: acct,
+		DisplayName: "non-prod", Status: client.TenantStatusActive, ExternalID: nil}
+	cei := map[string]tftypes.Value{"cloud_provider_account_id": strVal(acct)}
+	prior := lifecycleValue(nil, cei)
+	plan := lifecycleValue(map[string]tftypes.Value{"lucidity_dashboard_display_name": strVal("renamed")}, cei)
+
+	resp, _ := runUpdate(t, r, prior, plan)
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("Update: %+v", resp.Diagnostics)
+	}
+	if len(mock.patchCalls) != 1 || mock.patchCalls[0].CloudEntityInformation.ExternalID != "" {
+		t.Fatalf("PATCH must carry only the display name, got %+v", mock.patchCalls)
+	}
+}
+
+func TestLifecycle_ImportedTenantWithNullRemoteExternalIDIsBackfilledByUpdate(t *testing.T) {
+	fastPolling(t)
+	r, mock, _ := newLifecycleResource(t)
+	const acct = "123456789012"
+	mock.tenants[acct] = &mockTenant{TenantID: "t", CloudProvider: "AWS", CloudProviderAccountID: acct,
+		DisplayName: "non-prod", Status: client.TenantStatusActive, ExternalID: nil}
+	cei := map[string]tftypes.Value{"cloud_provider_account_id": strVal(acct)}
+	// State right after import + Read against a null remote: no external ID.
+	imported := lifecycleValue(nil, map[string]tftypes.Value{"cloud_provider_account_id": strVal(acct), "aws_iam_external_id": tftypes.NewValue(tftypes.String, nil)})
+	plan := lifecycleValue(nil, cei)
+
+	resp, _ := runUpdate(t, r, imported, plan)
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("Update: %+v", resp.Diagnostics)
+	}
+	if mock.tenants[acct].ExternalID == nil || *mock.tenants[acct].ExternalID != extIDA {
+		t.Fatalf("update should have written the configured external ID to Lucidity, remote=%v", mock.tenants[acct].ExternalID)
+	}
+}
+
+func TestHandleUpdateError_Ambiguous401(t *testing.T) {
+	var d diag.Diagnostics
+	handleUpdateError(&d, client.AuthError{}, "123456789012", true)
+	if len(d) != 1 || d[0].Summary() != "Lucidity rejected the update (401)" || !strings.Contains(d[0].Detail(), "trust policy") {
+		t.Fatalf("expected the dual-cause 401 diagnostic with trust-policy advice, got %+v", d)
+	}
+	var d2 diag.Diagnostics
+	handleUpdateError(&d2, client.AuthError{}, "123456789012", false)
+	if len(d2) != 1 || d2[0].Summary() != "Unable to update Lucidity tenant" {
+		t.Fatalf("a 401 on a display-name-only update stays a plain auth error, got %+v", d2)
+	}
+}
+
+// --- onboard 5xx / timeout: re-list instead of retry ---------------------
+
+func onboardPlan(accountID string) tftypes.Value {
+	return lifecycleValue(map[string]tftypes.Value{"lucidity_dashboard_display_name": strVal("onboard-fault")},
+		map[string]tftypes.Value{"cloud_provider_account_id": strVal(accountID)})
+}
+
+func runCreate(t *testing.T, r *tenantResource, plan tftypes.Value) (*resource.CreateResponse, tenantResourceModel) {
+	t.Helper()
+	sch := tenantSchema(t)
+	resp := &resource.CreateResponse{State: tfsdk.State{Schema: sch}}
+	r.Create(context.Background(), resource.CreateRequest{Plan: tfsdk.Plan{Raw: plan, Schema: sch}}, resp)
+	var m tenantResourceModel
+	if !resp.State.Raw.IsNull() {
+		resp.State.Get(context.Background(), &m)
+	}
+	return resp, m
+}
+
+func hasDiag(d diag.Diagnostics, summary string) bool {
+	for _, x := range d {
+		if x.Summary() == summary {
+			return true
+		}
+	}
+	return false
+}
+
+func TestLifecycle_OnboardUnknownOutcome_AdoptsActiveTenant(t *testing.T) {
+	for _, fault := range []string{"500-created", "drop-created"} {
+		t.Run(fault, func(t *testing.T) {
+			fastPolling(t)
+			r, mock, _ := newLifecycleResource(t)
+			mock.onboardFault = fault
+
+			resp, m := runCreate(t, r, onboardPlan("666666666666"))
+			if resp.Diagnostics.HasError() {
+				t.Fatalf("Create should adopt the tenant, got: %+v", resp.Diagnostics)
+			}
+			if mock.onboardCalls != 1 {
+				t.Fatalf("the onboard POST must not be re-sent, got %d calls", mock.onboardCalls)
+			}
+			if !hasDiag(resp.Diagnostics, "Onboard call failed but the tenant exists — adopted and synced") {
+				t.Fatalf("expected the adoption warning, got: %+v", resp.Diagnostics)
+			}
+			if m.Status.ValueString() != client.TenantStatusActive || m.TenantID.ValueString() != "mock_666666666666" {
+				t.Fatalf("state must reflect the adopted tenant, got %+v", m)
+			}
+			if len(mock.patchCalls) != 0 {
+				t.Fatalf("nothing differed, so no sync PATCH expected, got %+v", mock.patchCalls)
+			}
+		})
+	}
+}
+
+func TestLifecycle_OnboardUnknownOutcome_SyncsMismatchedFields(t *testing.T) {
+	fastPolling(t)
+	r, mock, _ := newLifecycleResource(t)
+	mock.onboardFault = "500-created-other"
+
+	resp, m := runCreate(t, r, onboardPlan("777777777777"))
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("Create: %+v", resp.Diagnostics)
+	}
+	if len(mock.patchCalls) != 1 {
+		t.Fatalf("expected exactly one sync PATCH, got %+v", mock.patchCalls)
+	}
+	p := mock.patchCalls[0]
+	if p.DisplayName != "onboard-fault" || p.CloudEntityInformation.ExternalID != extIDA {
+		t.Fatalf("sync PATCH must carry the configured display name and external ID, got %+v", p)
+	}
+	got := mock.tenants["777777777777"]
+	if got.DisplayName != "onboard-fault" || *got.ExternalID != extIDA {
+		t.Fatalf("remote not brought in line with config: %+v", got)
+	}
+	if m.DisplayName.ValueString() != "onboard-fault" || m.CloudEntityInformation.ExternalID.ValueString() != extIDA {
+		t.Fatalf("state must hold config values, got %+v", m)
+	}
+}
+
+func TestLifecycle_OnboardUnknownOutcome_InactiveIsAnError(t *testing.T) {
+	fastPolling(t)
+	r, mock, _ := newLifecycleResource(t)
+	mock.onboardFault = "500-inactive"
+
+	resp, _ := runCreate(t, r, onboardPlan("888888888888"))
+	if !hasDiag(resp.Diagnostics, "Account already exists and is in inactive state") {
+		t.Fatalf("expected the inactive-account error, got: %+v", resp.Diagnostics)
+	}
+	if !resp.State.Raw.IsNull() {
+		t.Fatal("no state may be saved for an INACTIVE tenant")
+	}
+	for _, d := range resp.Diagnostics {
+		if strings.Contains(d.Detail(), "support@lucidity.cloud") {
+			return
+		}
+	}
+	t.Fatal("error must tell the user to contact support@lucidity.cloud")
+}
+
+func TestLifecycle_OnboardUnknownOutcome_NotFoundRecommendsActions(t *testing.T) {
+	fastPolling(t)
+	r, mock, _ := newLifecycleResource(t)
+	mock.onboardFault = "500-lost"
+
+	resp, _ := runCreate(t, r, onboardPlan("999999999999"))
+	if !hasDiag(resp.Diagnostics, "Onboard outcome unknown: tenant not found after re-listing") {
+		t.Fatalf("expected the outcome-unknown error, got: %+v", resp.Diagnostics)
+	}
+	if mock.onboardCalls != 1 {
+		t.Fatalf("the POST must never be auto-retried, got %d calls", mock.onboardCalls)
+	}
+	detail := resp.Diagnostics[len(resp.Diagnostics)-1].Detail()
+	for _, want := range []string{"Recommended actions", "terraform import", "support@lucidity.cloud", "requestId=mock-request-id"} {
+		if !strings.Contains(detail, want) {
+			t.Errorf("diagnostic missing %q: %s", want, detail)
+		}
+	}
+	if !resp.State.Raw.IsNull() {
+		t.Fatal("no state may be saved when the tenant was not found")
+	}
+}
+
+func TestLifecycle_ActiveDuplicateErrorPointsAtImport(t *testing.T) {
+	r, mock, _ := newLifecycleResource(t)
+	mock.tenants["211125699795"] = &mockTenant{TenantID: "t", CloudProvider: "AWS", CloudProviderAccountID: "211125699795",
+		DisplayName: "x", Status: client.TenantStatusActive}
+
+	resp, _ := runCreate(t, r, onboardPlan("211125699795"))
+	if !hasDiag(resp.Diagnostics, "Tenant already exists") {
+		t.Fatalf("expected the duplicate error, got: %+v", resp.Diagnostics)
+	}
+	if !strings.Contains(resp.Diagnostics[0].Detail(), "terraform import lucidity_tenant.<name> AWS/211125699795") {
+		t.Fatalf("duplicate error should give the import command, got: %s", resp.Diagnostics[0].Detail())
+	}
 }

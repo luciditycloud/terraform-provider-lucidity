@@ -11,6 +11,21 @@ once it reaches a stable release cadence.
 
 ### Added
 
+- `terraform import` now recovers `aws_iam_external_id`: Lucidity's List
+  API returns `externalId`, and `Read` copies it into state (older backends
+  that omit the key, or a null value, leave state untouched, so there is no
+  perpetual diff). A remote value that differs from state surfaces as drift.
+- `aws_iam_external_id` is now updatable in place: `Update` sends
+  `externalId` in the PATCH. Rotate the IAM trust policy first — Lucidity
+  re-validates by assuming the role.
+- After `terraform import`, `lucidity_product_list` and `aws_org_root_id`
+  (not returned by List yet) are assumed to match config: empty state no
+  longer forces a replace (`lucidity_product_list`) or errors
+  (`aws_org_root_id`); the config value is simply recorded.
+- When an onboard call ends in a 5xx, timeout or connection error, the
+  provider re-lists instead of retrying: ACTIVE tenant → adopted and synced
+  to config via the update API (with a warning); INACTIVE → error telling the
+  user to contact support; not found → error with recommended actions.
 - `lucidity_dashboard_display_name` now rejects a blank value client-side
   at plan time, instead of only surfacing a confusing generic "Nothing to
   update" error from Lucidity's API (Update silently omits an
@@ -30,6 +45,19 @@ once it reaches a stable release cadence.
   wrong-but-well-formed account number.
 
 ### Changed
+
+- The onboard POST is no longer auto-retried on 5xx (`Client.DoNoRetry5xx`);
+  all other calls keep the existing backoff retry. Transport failures are now
+  a typed `client.TransportError`, and `client.IsOutcomeUnknown` classifies
+  5xx/timeouts/connection errors.
+- `aws_iam_external_id` no longer forces replacement when changed.
+- The "Tenant already exists" errors (pre-check and native 409) no longer
+  claim it is only a `for_each` collision; they explain it may be a tenant
+  from an earlier failed/timed-out apply and give the `terraform import`
+  command.
+- A 401 on an update that changes role/policy/external ID is reported as
+  "Lucidity rejected the update (401)" with trust-policy advice instead of a
+  bare expired-token message.
 
 - Clarified the `skip_cloud_permission_check` documentation in `README.md`
   to match the schema description: it skips the permission check only,

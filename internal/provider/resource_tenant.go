@@ -135,13 +135,10 @@ func (r *tenantResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 					"aws_iam_external_id": schema.StringAttribute{
 						Optional: true,
 						Description: "AWS only — required for onboarding, ignored for AZURE/GCP. Must be a UUID (Lucidity's own API applies no format check server-side, so this provider validates it client-side to catch typos before any API call). Generate one yourself and put it in your IAM role's trust policy. Lucidity sends it on every AssumeRole so your role only trusts requests carrying it. " +
-							"Immutable forever once onboarded — Lucidity never returns this value again (write-only) and never applies a changed one via update, so this provider cannot detect drift on it and treats any config change as requiring a full replace (destroy + re-onboard). " +
-							"terraform import cannot recover this value; you must supply the real one that matches your IAM role's trust policy, or the very next apply will force a replace.",
+							"Readable and updatable in place: Lucidity returns it from List (so `terraform import` recovers it and drift is detected) and accepts a new value via update. " +
+							"To rotate it, update your IAM role's trust policy FIRST, then change this value — Lucidity re-validates by assuming your role with the new value, and rejects the update if the trust policy doesn't already match.",
 						Validators: []validator.String{
 							stringvalidator.RegexMatches(uuidPattern, "must be a valid UUID (e.g. 8f14e45f-ceea-4331-9f5e-111111111111)"),
-						},
-						PlanModifiers: []planmodifier.String{
-							stringplanmodifier.RequiresReplace(),
 						},
 					},
 					"aws_iam_role_name": schema.StringAttribute{
@@ -181,13 +178,23 @@ func (r *tenantResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 			"lucidity_product_list": schema.ListAttribute{
 				Optional:    true,
 				ElementType: types.StringType,
-				Description: "AWS only — required for onboarding (non-empty), ignored for AZURE/GCP (Update doesn't accept it for any provider, and List never returns it, so it can't be recovered by import either). Only \"AUTOSCALER\" is supported today. Not updatable via any documented API — changing it forces a replace (re-onboard).",
+				Description: "AWS only — required for onboarding (non-empty), ignored for AZURE/GCP (Update doesn't accept it for any provider, and List never returns it, so it can't be recovered by import either). Only \"AUTOSCALER\" is supported today. Not updatable via any documented API — changing a value already recorded in state forces a replace (re-onboard). Not returned by List either, so after `terraform import` it is assumed to match your config rather than compared (a future Lucidity release is expected to expose it).",
 				Validators: []validator.List{
 					listvalidator.SizeAtLeast(1),
 					listvalidator.ValueStringsAre(stringvalidator.OneOf("AUTOSCALER")),
 				},
 				PlanModifiers: []planmodifier.List{
-					listplanmodifier.RequiresReplace(),
+					listplanmodifier.RequiresReplaceIf(
+						func(_ context.Context, req planmodifier.ListRequest, resp *listplanmodifier.RequiresReplaceIfFuncResponse) {
+							// Empty state (e.g. right after import, since List never
+							// returns this) means "nothing recorded to compare" — assume
+							// the config matches reality and just record it, rather than
+							// forcing an irreversible deboard + re-onboard.
+							resp.RequiresReplace = !req.StateValue.IsNull() && len(req.StateValue.Elements()) > 0
+						},
+						"Forces replacement only when a product list already recorded in state changes.",
+						"Forces replacement only when a product list already recorded in state changes.",
+					),
 				},
 			},
 			"skip_cloud_permission_check": schema.BoolAttribute{
@@ -327,14 +334,17 @@ func (r *tenantResource) ModifyPlan(ctx context.Context, req resource.ModifyPlan
 		return
 	}
 
-	if plan.AWSRootID.IsUnknown() || plan.AWSRootID.Equal(state.AWSRootID) {
+	// A null state value (e.g. right after import — List never returns this)
+	// means nothing is recorded to contradict, so the config value is simply
+	// assumed to match reality and recorded on the next apply.
+	if plan.AWSRootID.IsUnknown() || plan.AWSRootID.Equal(state.AWSRootID) || state.AWSRootID.IsNull() {
 		return
 	}
 
 	resp.Diagnostics.AddAttributeError(
 		path.Root("aws_org_root_id"),
 		"aws_org_root_id cannot be modified",
-		"Changing aws_org_root_id after onboarding is not supported in this release — Lucidity has no update mechanism for it. "+
+		"Changing an aws_org_root_id already recorded in state is not supported in this release — Lucidity has no update mechanism for it. "+
 			"Revert it to its current value. If it truly must change, that requires destroying and re-creating this resource "+
 			"(mind lucidity_dashboard_account_delete_protection and lucidity_account_destroy_behavior — deboarding is irreversible). "+
 			"A future release of this provider may add support for modifying it in place, if and when Lucidity exposes an update mechanism for it.",
@@ -364,10 +374,10 @@ func (r *tenantResource) ImportState(ctx context.Context, req resource.ImportSta
 	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("lucidity_dashboard_account_delete_protection"), true)...)
 
 	resp.Diagnostics.AddWarning(
-		"Some lucidity_tenant fields cannot be recovered by import",
-		"aws_iam_external_id, aws_org_root_id, lucidity_product_list, and skip_cloud_permission_check are never returned by Lucidity's List API (aws_iam_external_id and aws_org_root_id are write-only; the others simply aren't exposed there), so this import cannot populate them. "+
-			"Write a resource block with the real values that match this account's actual configuration. aws_iam_role_name, aws_iam_policy_name, azure_service_principal_id, azure_directory_id, and lucidity_dashboard_display_name will reconcile safely via a normal update on the next apply if they don't match. "+
-			"aws_iam_external_id and lucidity_product_list are NOT updatable, though: if the value you write doesn't match reality, the next apply will force a destroy-and-recreate of this tenant (deboarding is IRREVERSIBLE) rather than silently drifting. Review carefully before applying. "+
+		"Some lucidity_tenant fields are assumed, not read, on import",
+		"After import, aws_iam_external_id and lucidity_dashboard_display_name are read from Lucidity (List returns them); a mismatch with your config is reconciled in place on the next apply (an external ID update is validated against your IAM role's trust policy — update the trust policy first). "+
+			"aws_iam_role_name, aws_iam_policy_name, azure_service_principal_id, and azure_directory_id are not returned by List and are likewise reconciled via a normal update on the next apply. "+
+			"lucidity_product_list and aws_org_root_id are not returned by List either: they are assumed to match your config and simply recorded on the next apply (never compared, never forcing a replace). skip_cloud_permission_check is onboard-only and local. "+
 			"For an AZURE or GCP tenant, leave the AWS-only fields (aws_iam_external_id, aws_iam_role_name, aws_iam_policy_name) unset entirely — they're only required when cloud_provider is AWS.",
 	)
 }
@@ -429,7 +439,16 @@ func (r *tenantResource) Create(ctx context.Context, req resource.CreateRequest,
 	}
 
 	if _, err := r.client.OnboardTenant(ctx, onboardReq); err != nil {
-		handleOnboardError(&resp.Diagnostics, err, accountID)
+		if !client.IsOutcomeUnknown(ctx, err) {
+			handleOnboardError(&resp.Diagnostics, err, accountID)
+			return
+		}
+		// 5xx / timeout / connection error: the POST may have created the
+		// tenant. Never blindly re-POST (a retry after a successful create
+		// is a masking 409) — re-list and decide from what's actually there.
+		if r.recoverUnknownOnboard(ctx, &plan, err, &resp.Diagnostics) {
+			resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
+		}
 		return
 	}
 
@@ -441,6 +460,163 @@ func (r *tenantResource) Create(ctx context.Context, req resource.CreateRequest,
 	}
 
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
+}
+
+// recoverUnknownOnboard handles an onboard POST whose outcome is unknown
+// (5xx, timeout, connection error) by polling List for the account. Returns
+// true when the tenant exists, is ACTIVE and has been synced to the plan, so
+// the caller should save state; false (with error diagnostics already added)
+// otherwise. Only display name and external ID are verifiable here — List
+// doesn't return role/policy names, product list or org root ID, so those
+// are assumed to match (they came from the same request that may have
+// created the tenant).
+func (r *tenantResource) recoverUnknownOnboard(ctx context.Context, plan *tenantResourceModel, onboardErr error, diags *diag.Diagnostics) bool {
+	cloudProvider := plan.CloudEntityInformation.CloudProvider.ValueString()
+	accountID := plan.CloudEntityInformation.CloudProviderAccountID.ValueString()
+	requestID := ""
+	var apiErr *client.APIError
+	if errors.As(onboardErr, &apiErr) {
+		requestID = apiErr.RequestID
+	}
+	reqIDText := ""
+	if requestID != "" {
+		reqIDText = fmt.Sprintf(" (requestId=%s)", requestID)
+	}
+
+	item, found, listErr := r.pollForTenant(ctx, cloudProvider, accountID)
+	if listErr != nil {
+		diags.AddError(
+			"Onboard outcome unknown, and re-listing tenants failed",
+			fmt.Sprintf(
+				"The onboard call for cloud account %s failed in a way that doesn't show whether the tenant was created: %s%s. The provider did not retry the POST, and then could not list tenants to check: %s.\n\n"+
+					"Recommended actions: (1) check the Lucidity dashboard for account %s; (2) if it is there and ACTIVE, run `terraform import lucidity_tenant.<name> %s/%s` and then `terraform apply` to sync it to your config; (3) if it is not there, run `terraform apply` again.",
+				accountID, onboardErr.Error(), reqIDText, listErr.Error(), accountID, cloudProvider, accountID,
+			),
+		)
+		return false
+	}
+	if !found {
+		diags.AddError(
+			"Onboard outcome unknown: tenant not found after re-listing",
+			fmt.Sprintf(
+				"The onboard call for cloud account %s failed in a way that doesn't show whether the tenant was created: %s%s. The provider did NOT retry the POST (a retry after a successful create would only surface a misleading \"already exists\" conflict). "+
+					"It re-listed tenants %d times over %s and the account does not appear — but List can lag 2+ minutes behind a real onboard.\n\n"+
+					"Recommended actions: (1) wait a few minutes, then run `terraform apply` again — it checks for an existing tenant before onboarding, and if the account turns out to exist it stops with import instructions; "+
+					"(2) or check the Lucidity dashboard now: if account %s is there and ACTIVE, run `terraform import lucidity_tenant.<name> %s/%s` then `terraform apply`; "+
+					"(3) if it keeps failing, contact support@lucidity.cloud and quote the requestId.",
+				accountID, onboardErr.Error(), reqIDText, refreshFromListRetries, time.Duration(refreshFromListRetries)*refreshFromListDelay, accountID, cloudProvider, accountID,
+			),
+		)
+		return false
+	}
+	if item.Status != client.TenantStatusActive {
+		diags.AddError(
+			"Account already exists and is in inactive state",
+			fmt.Sprintf(
+				"Cloud account %s (tenantId=%s) already exists on Lucidity and is in inactive state (%s)%s. Please reach out to support@lucidity.cloud to make the account active. "+
+					"Leave this Terraform change pending until then; once support reactivates it, `terraform import lucidity_tenant.<name> %s/%s` and apply.",
+				accountID, item.TenantID, item.Status, reqIDText, cloudProvider, accountID,
+			),
+		)
+		return false
+	}
+
+	// ACTIVE: bring the remote in line with config using the update API.
+	updateReq := client.UpdateTenantRequest{CloudEntityInformation: client.CloudEntityInformation{
+		CloudProvider:          cloudProvider,
+		CloudProviderAccountID: accountID,
+	}}
+	var synced []string
+	if item.DisplayName != plan.DisplayName.ValueString() {
+		updateReq.DisplayName = plan.DisplayName.ValueString()
+		synced = append(synced, "lucidity_dashboard_display_name")
+	}
+	sentExternalID := externalIDMismatch(item, plan)
+	if sentExternalID {
+		updateReq.CloudEntityInformation.ExternalID = plan.CloudEntityInformation.ExternalID.ValueString()
+		synced = append(synced, "aws_iam_external_id")
+	}
+	if len(synced) > 0 {
+		if _, err := r.client.UpdateTenant(ctx, updateReq); err != nil {
+			var syncDiags diag.Diagnostics
+			handleUpdateError(&syncDiags, err, accountID, sentExternalID)
+			for _, d := range syncDiags {
+				diags.AddError(
+					"Tenant exists but could not be synced to your config",
+					fmt.Sprintf(
+						"The onboard call failed (%s) but cloud account %s already exists and is ACTIVE; syncing %s to your config then failed: %s: %s\n\n"+
+							"Recommended actions: fix the cause above, then `terraform import lucidity_tenant.<name> %s/%s` and `terraform apply` — the update is retried as a normal in-place change.",
+						onboardErr.Error(), accountID, strings.Join(synced, ", "), d.Summary(), d.Detail(), cloudProvider, accountID,
+					),
+				)
+			}
+			return false
+		}
+	}
+	if d := r.refreshFromList(ctx, cloudProvider, accountID, plan, func(it client.TenantListItem) bool {
+		return listItemMatchesPlan(it, *plan, sentExternalID)
+	}); d.HasError() {
+		diags.Append(d...)
+		return false
+	}
+
+	detail := fmt.Sprintf(
+		"The onboard call for cloud account %s failed (%s)%s, but the tenant exists on Lucidity and is ACTIVE (tenantId=%s), so it was adopted into Terraform state. ",
+		accountID, onboardErr.Error(), reqIDText, item.TenantID,
+	)
+	if len(synced) > 0 {
+		detail += fmt.Sprintf("Fields synced to your config via the update API: %s. ", strings.Join(synced, ", "))
+	} else {
+		detail += "Display name and external ID already matched your config. "
+	}
+	detail += "aws_iam_role_name, aws_iam_policy_name, lucidity_product_list and aws_org_root_id are not returned by List, so they were assumed to match. " +
+		"Recommended action: run `terraform plan` — it should show no changes; if a field still differs, apply it as a normal update."
+	diags.AddWarning("Onboard call failed but the tenant exists — adopted and synced", detail)
+	return true
+}
+
+// pollForTenant re-lists until the account appears or the refreshFromList
+// budget is spent. A List error aborts immediately.
+func (r *tenantResource) pollForTenant(ctx context.Context, cloudProvider, accountID string) (client.TenantListItem, bool, error) {
+	for attempt := 0; ; attempt++ {
+		tenants, err := r.client.ListTenants(ctx)
+		if err != nil {
+			return client.TenantListItem{}, false, err
+		}
+		if item, ok := client.FindTenant(tenants, cloudProvider, accountID); ok {
+			return item, true, nil
+		}
+		if attempt >= refreshFromListRetries-1 {
+			return client.TenantListItem{}, false, nil
+		}
+		select {
+		case <-time.After(refreshFromListDelay):
+		case <-ctx.Done():
+			return client.TenantListItem{}, false, ctx.Err()
+		}
+	}
+}
+
+// externalIDMismatch reports whether Lucidity demonstrably holds a different
+// (or no) external ID than the model wants. An older backend that omits the
+// field from List can't be compared, so it is never a mismatch.
+func externalIDMismatch(item client.TenantListItem, model *tenantResourceModel) bool {
+	want := model.CloudEntityInformation.ExternalID
+	if !item.ExternalIDReported || want.IsNull() || want.IsUnknown() || want.ValueString() == "" {
+		return false
+	}
+	return item.ExternalID == nil || !strings.EqualFold(*item.ExternalID, want.ValueString())
+}
+
+// listItemMatchesPlan is the freshness check for post-update List results:
+// display name always, external ID only when this operation just changed it
+// (an untouched external ID may legitimately read back null on tenants
+// onboarded before Lucidity stored it).
+func listItemMatchesPlan(item client.TenantListItem, plan tenantResourceModel, checkExternalID bool) bool {
+	if item.DisplayName != plan.DisplayName.ValueString() {
+		return false
+	}
+	return !checkExternalID || !externalIDMismatch(item, &plan)
 }
 
 func (r *tenantResource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
@@ -470,7 +646,7 @@ func (r *tenantResource) Read(ctx context.Context, req resource.ReadRequest, res
 		return
 	}
 
-	applyListItem(&state, found)
+	applyListItem(&state, found, true)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 
 	if found.Status != client.TenantStatusActive {
@@ -508,6 +684,15 @@ func (r *tenantResource) Update(ctx context.Context, req resource.UpdateRequest,
 		},
 	}
 	changed := false
+	// Rotation order matters: the user must update the AWS trust policy
+	// first — Lucidity re-validates via AssumeRole with the new value.
+	externalIDChanged := !plan.CloudEntityInformation.ExternalID.IsNull() &&
+		!plan.CloudEntityInformation.ExternalID.IsUnknown() &&
+		!plan.CloudEntityInformation.ExternalID.Equal(state.CloudEntityInformation.ExternalID)
+	if externalIDChanged {
+		updateReq.CloudEntityInformation.ExternalID = plan.CloudEntityInformation.ExternalID.ValueString()
+		changed = true
+	}
 	if !plan.DisplayName.Equal(state.DisplayName) {
 		updateReq.DisplayName = plan.DisplayName.ValueString()
 		changed = true
@@ -531,7 +716,8 @@ func (r *tenantResource) Update(ctx context.Context, req resource.UpdateRequest,
 
 	if changed {
 		if _, err := r.client.UpdateTenant(ctx, updateReq); err != nil {
-			handleUpdateError(&resp.Diagnostics, err, accountID)
+			validatesCloudAccount := externalIDChanged || updateReq.CloudEntityInformation.AWSIAMRoleName != "" || updateReq.CloudEntityInformation.AWSIAMPolicyName != ""
+			handleUpdateError(&resp.Diagnostics, err, accountID, validatesCloudAccount)
 			return
 		}
 	}
@@ -539,13 +725,12 @@ func (r *tenantResource) Update(ctx context.Context, req resource.UpdateRequest,
 	// lucidity_account_destroy_behavior are local-only / onboard-only — no API call needed;
 	// the planned value is simply carried into state below.
 
-	// display_name is the only field List actually returns that Update() can
-	// also change, so it's the only one worth checking for staleness here —
-	// role/policy name changes aren't visible via List at all (applyListItem
-	// never touches them), so they can't come back stale this way.
-	wantDisplayName := plan.DisplayName.ValueString()
+	// display_name and external_id are the only fields List returns that
+	// Update() can change, so they're the only ones worth checking for
+	// staleness here — role/policy name changes aren't visible via List at
+	// all, so they can't come back stale this way.
 	if diags := r.refreshFromList(ctx, cloudProvider, accountID, &plan, func(item client.TenantListItem) bool {
-		return item.DisplayName == wantDisplayName
+		return listItemMatchesPlan(item, plan, externalIDChanged)
 	}); diags.HasError() {
 		resp.Diagnostics.Append(diags...)
 		return
@@ -630,7 +815,9 @@ func (r *tenantResource) Delete(ctx context.Context, req resource.DeleteRequest,
 // branch, including genuine failures, and no finite bound fully
 // eliminates the tail — the documented manual-retry-the-apply fallback
 // stays the answer for delays beyond this window.
-const (
+//
+// Vars rather than consts only so tests can shrink the wait.
+var (
 	refreshFromListRetries = 10
 	refreshFromListDelay   = 15 * time.Second
 )
@@ -652,7 +839,7 @@ func (r *tenantResource) refreshFromList(ctx context.Context, cloudProvider, acc
 			return diags
 		}
 		if found, ok := client.FindTenant(tenants, cloudProvider, accountID); ok && (fresh == nil || fresh(found)) {
-			applyListItem(model, found)
+			applyListItem(model, found, false)
 			return diags
 		}
 		if attempt >= refreshFromListRetries-1 {
@@ -674,13 +861,28 @@ func (r *tenantResource) refreshFromList(ctx context.Context, cloudProvider, acc
 	}
 }
 
-func applyListItem(model *tenantResourceModel, item client.TenantListItem) {
+// applyListItem copies List's server-side fields into model. readExternalID
+// is true only for Read: there, Lucidity is the source of truth (this is
+// what makes import recover aws_iam_external_id and drift detectable). After
+// Create/Update the plan's value must be kept as-is, or the framework flags
+// an inconsistent result. A null/absent remote value never overwrites state
+// (older backends omit it; pre-existing tenants may hold none).
+func applyListItem(model *tenantResourceModel, item client.TenantListItem, readExternalID bool) {
 	model.TenantID = types.StringValue(item.TenantID)
 	model.Status = types.StringValue(item.Status)
 	model.CloudEntityName = types.StringValue(item.CloudEntityName)
 	model.DisplayName = types.StringValue(item.DisplayName)
 	model.CloudEntityInformation.CloudProvider = types.StringValue(item.CloudProvider)
 	model.CloudEntityInformation.CloudProviderAccountID = types.StringValue(item.CloudProviderAccountID)
+
+	if readExternalID && item.CloudProvider == "AWS" && item.ExternalID != nil {
+		cur := model.CloudEntityInformation.ExternalID
+		// Keep the configured casing when it only differs by case, so a
+		// harmless normalization on Lucidity's side isn't reported as drift.
+		if cur.IsNull() || cur.IsUnknown() || !strings.EqualFold(cur.ValueString(), *item.ExternalID) {
+			model.CloudEntityInformation.ExternalID = types.StringValue(*item.ExternalID)
+		}
+	}
 }
 
 // addExistingTenantError distinguishes the two pre-check outcomes: an
@@ -692,8 +894,8 @@ func addExistingTenantError(diags *diag.Diagnostics, existing client.TenantListI
 		diags.AddError(
 			"Tenant already exists",
 			fmt.Sprintf(
-				"A tenant already exists for cloud account %s (tenantId=%s) and is ACTIVE. This is a configuration error — most likely a for_each/key collision — not a Lucidity-support situation.",
-				accountID, existing.TenantID,
+				"A tenant already exists for cloud account %s (tenantId=%s) and is ACTIVE. Not a Lucidity-support situation. Either (a) it was onboarded earlier — by a previous apply that failed or timed out after the tenant was created, or outside Terraform — in which case bring it under management with `terraform import lucidity_tenant.<name> %s/%s` and then `terraform apply` to sync your config; or (b) two resources in your configuration target the same account (e.g. a for_each key collision) — remove the duplicate.",
+				accountID, existing.TenantID, existing.CloudProvider, accountID,
 			),
 		)
 		return
@@ -729,7 +931,10 @@ func handleOnboardError(diags *diag.Diagnostics, err error, accountID string) {
 			}
 			diags.AddError(
 				"Tenant already exists",
-				fmt.Sprintf("A tenant already exists for cloud account %s (requestId=%s). This is a configuration error — most likely a for_each/key collision.", accountID, apiErr.RequestID),
+				fmt.Sprintf(
+					"A tenant already exists for cloud account %s (requestId=%s). Either it was onboarded earlier (a previous apply that failed or timed out after the tenant was created, or outside Terraform) — run `terraform import lucidity_tenant.<name> AWS/%s` then `terraform apply` — or two resources in your configuration target the same account (e.g. a for_each key collision).",
+					accountID, apiErr.RequestID, accountID,
+				),
 			)
 			return
 		case "UNAUTHORIZED":
@@ -751,7 +956,28 @@ func handleOnboardError(diags *diag.Diagnostics, err error, accountID string) {
 	diags.AddError("Unable to onboard Lucidity tenant", err.Error())
 }
 
-func handleUpdateError(diags *diag.Diagnostics, err error, accountID string) {
+const updateValidationHint = "Lucidity re-validates by assuming your IAM role when the role name, policy name or external ID changes. " +
+	"Check that the role exists, and that its trust policy already allows Lucidity with the NEW external ID — rotate the trust policy first, then apply this change."
+
+// validatesCloudAccount is true when the PATCH carried a field Lucidity
+// re-validates via AssumeRole (role/policy name, external ID).
+func handleUpdateError(diags *diag.Diagnostics, err error, accountID string, validatesCloudAccount bool) {
+	// A 401 here is ambiguous: client.Do already refreshed the token once, so
+	// it is either a genuinely dead refresh token or Lucidity failing to
+	// assume the role. The exact AssumeRole-failure body isn't known, so
+	// decide from what the request carried rather than from message text.
+	var authErr client.AuthError
+	if validatesCloudAccount && errors.As(err, &authErr) {
+		diags.AddError(
+			"Lucidity rejected the update (401)",
+			fmt.Sprintf(
+				"Lucidity answered 401 to the update for cloud account %s. This is either a rejected refresh token, or Lucidity failing to validate the cloud account after a role/policy/external-ID change. "+
+					"If other Lucidity calls in this run succeeded, it is almost certainly the latter. %s",
+				accountID, updateValidationHint,
+			),
+		)
+		return
+	}
 	var apiErr *client.APIError
 	if errors.As(err, &apiErr) {
 		switch apiErr.Code {
@@ -761,6 +987,14 @@ func handleUpdateError(diags *diag.Diagnostics, err error, accountID string) {
 				fmt.Sprintf("No tenant exists for cloud account %s (requestId=%s). It may have been deboarded or removed outside Terraform — run `terraform plan` to refresh state.", accountID, apiErr.RequestID),
 			)
 			return
+		case "UNAUTHORIZED":
+			if strings.Contains(strings.ToLower(apiErr.Message), "cloud account could not be validated") {
+				diags.AddError(
+					"Cloud account could not be validated",
+					fmt.Sprintf("Lucidity could not validate cloud account %s (requestId=%s): %s. %s", accountID, apiErr.RequestID, apiErr.Message, updateValidationHint),
+				)
+				return
+			}
 		case "CONFLICT":
 			diags.AddError(
 				"Lucidity tenant is not ACTIVE",

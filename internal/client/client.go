@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -192,6 +193,42 @@ func NewClient(baseURL, refreshToken string, opts ...Option) *Client {
 // body (nil for none), decoding the envelope's data field into out (nil to
 // discard it).
 func (c *Client) Do(ctx context.Context, method, path string, body any, out any) error {
+	return c.do(ctx, method, path, body, out, true)
+}
+
+// DoNoRetry5xx is Do without the 5xx auto-retry, for non-idempotent calls
+// (onboard) where a 5xx doesn't prove the operation failed. The 401
+// forced-refresh retry still applies — a 401 is rejected before anything
+// happens server-side, so resending is safe.
+func (c *Client) DoNoRetry5xx(ctx context.Context, method, path string, body any, out any) error {
+	return c.do(ctx, method, path, body, out, false)
+}
+
+// TransportError wraps a failure to complete the HTTP exchange (connection
+// refused/reset, timeout, truncated response) after the request may already
+// have been sent.
+type TransportError struct{ Err error }
+
+func (e *TransportError) Error() string { return e.Err.Error() }
+func (e *TransportError) Unwrap() error { return e.Err }
+
+// IsOutcomeUnknown reports whether err means the server may or may not have
+// applied the request: a 5xx, or a transport failure (timeout, connection
+// error) after sending. False for 4xx and for the caller's own ctx being
+// cancelled/expired — those are definite outcomes or an abort.
+func IsOutcomeUnknown(ctx context.Context, err error) bool {
+	if err == nil || ctx.Err() != nil {
+		return false
+	}
+	var apiErr *APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.HTTPStatus >= 500
+	}
+	var te *TransportError
+	return errors.As(err, &te)
+}
+
+func (c *Client) do(ctx context.Context, method, path string, body any, out any, retry5xx bool) error {
 	select {
 	case c.sem <- struct{}{}:
 	case <-ctx.Done():
@@ -248,7 +285,7 @@ func (c *Client) Do(ctx context.Context, method, path string, body any, out any)
 			}
 			return AuthError{}
 		case status >= 500:
-			if attempt >= maxRetryAttempts-1 {
+			if !retry5xx || attempt >= maxRetryAttempts-1 {
 				return parseErrorBody(status, respBody)
 			}
 			select {
@@ -292,13 +329,13 @@ func (c *Client) doOnce(ctx context.Context, method, path string, bodyBytes []by
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return 0, nil, fmt.Errorf("lucidity: request failed: %w", err)
+		return 0, nil, &TransportError{Err: fmt.Errorf("lucidity: request failed: %w", err)}
 	}
 	defer resp.Body.Close()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return 0, nil, fmt.Errorf("lucidity: reading response: %w", err)
+		return 0, nil, &TransportError{Err: fmt.Errorf("lucidity: reading response: %w", err)}
 	}
 
 	c.logDebug(ctx, "lucidity api call", map[string]any{

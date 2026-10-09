@@ -423,3 +423,86 @@ func TestTenantResourceRPC_PlanResourceChange_AllowsUnchangedAWSOrgRootID(t *tes
 		t.Fatalf("expected no error diagnostic when aws_org_root_id is unchanged, got: %+v", resp.Diagnostics)
 	}
 }
+
+// planTenantUpdate drives PlanResourceChange for an existing resource whose
+// prior state is prior and whose (fully-known) config/proposed state is cfg.
+func planTenantUpdate(t *testing.T, prior, cfg tftypes.Value) *tfprotov6.PlanResourceChangeResponse {
+	t.Helper()
+	srv := newTestProviderServer(t)
+	objType := tenantConfigType()
+	priorDV, err := tfprotov6.NewDynamicValue(objType, prior)
+	if err != nil {
+		t.Fatalf("NewDynamicValue(prior): %v", err)
+	}
+	cfgDV, err := tfprotov6.NewDynamicValue(objType, cfg)
+	if err != nil {
+		t.Fatalf("NewDynamicValue(config): %v", err)
+	}
+	resp, err := srv.PlanResourceChange(context.Background(), &tfprotov6.PlanResourceChangeRequest{
+		TypeName:         tenantResourceTypeName,
+		PriorState:       &priorDV,
+		ProposedNewState: &cfgDV,
+		Config:           &cfgDV,
+	})
+	if err != nil {
+		t.Fatalf("PlanResourceChange: %v", err)
+	}
+	return resp
+}
+
+func requiresReplaceOf(resp *tfprotov6.PlanResourceChangeResponse, attr string) bool {
+	for _, p := range resp.RequiresReplace {
+		for _, step := range p.Steps() {
+			if n, ok := step.(tftypes.AttributeName); ok && string(n) == attr {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func nullList() tftypes.Value {
+	return tftypes.NewValue(tftypes.List{ElementType: tftypes.String}, nil)
+}
+
+func TestTenantResourceRPC_PlanResourceChange_ExternalIDChangeIsInPlace(t *testing.T) {
+	prior := tenantFullValue(nil, nil)
+	cfg := tenantFullValue(nil, map[string]tftypes.Value{"aws_iam_external_id": strVal("00000000-0000-4000-8000-000000000000")})
+
+	resp := planTenantUpdate(t, prior, cfg)
+	if hasErrorDiagnostic(resp.Diagnostics) {
+		t.Fatalf("expected no error, got: %+v", resp.Diagnostics)
+	}
+	if len(resp.RequiresReplace) != 0 {
+		t.Fatalf("external ID is updatable in place now; got forced replace on: %+v", resp.RequiresReplace)
+	}
+}
+
+func TestTenantResourceRPC_PlanResourceChange_ProductListChangeStillReplaces(t *testing.T) {
+	prior := tenantFullValue(nil, nil)
+	cfg := tenantFullValue(map[string]tftypes.Value{
+		"lucidity_product_list": tftypes.NewValue(tftypes.List{ElementType: tftypes.String}, []tftypes.Value{strVal("AUTOSCALER"), strVal("AUTOSCALER")}),
+	}, nil)
+
+	resp := planTenantUpdate(t, prior, cfg)
+	if !requiresReplaceOf(resp, "lucidity_product_list") {
+		t.Fatalf("changing a product list already recorded in state must force replace, got RequiresReplace=%+v diags=%+v", resp.RequiresReplace, resp.Diagnostics)
+	}
+}
+
+func TestTenantResourceRPC_PlanResourceChange_NullStateProductListAndOrgRootAreAssumedNotCompared(t *testing.T) {
+	// State after `terraform import`: List never returns either field.
+	prior := tenantFullValue(map[string]tftypes.Value{
+		"lucidity_product_list": nullList(),
+		"aws_org_root_id":       tftypes.NewValue(tftypes.String, nil),
+	}, nil)
+	cfg := tenantFullValue(nil, nil) // config supplies both
+
+	resp := planTenantUpdate(t, prior, cfg)
+	if hasErrorDiagnostic(resp.Diagnostics) {
+		t.Fatalf("expected no error when recording previously-unreadable fields, got: %+v", resp.Diagnostics)
+	}
+	if len(resp.RequiresReplace) != 0 {
+		t.Fatalf("expected no forced replace after import, got: %+v", resp.RequiresReplace)
+	}
+}
