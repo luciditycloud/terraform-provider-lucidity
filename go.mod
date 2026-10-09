@@ -1,4 +1,4 @@
-module github.com/Devaansh/terraform-provider-lucidity
+module github.com/luciditycloud/terraform-provider-lucidity
 
 go 1.26.5
 

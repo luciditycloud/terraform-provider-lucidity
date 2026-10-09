@@ -6,19 +6,13 @@ Published to the public Terraform Registry as a community provider, built to Par
 About Lucidity - https://www.lucidity.cloud/
 
 
-<!-- promote-to-stable:remove:start -->
-Two Registry namespaces:
-
-- `registry.terraform.io/luciditycloud/lucidity` — **official stable**
-- `registry.terraform.io/Devaansh/lucidity` — **beta**
-<!-- promote-to-stable:remove:end -->
 
 
 ```hcl
 terraform {
   required_providers {
     lucidity = {
-      source  = "Devaansh/lucidity"
+      source  = "luciditycloud/lucidity"
       version = "~> 0.1"
     }
   }

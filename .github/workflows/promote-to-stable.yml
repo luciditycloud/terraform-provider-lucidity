@@ -3,7 +3,7 @@ name: Promote to luciditycloud stable
 # Manually triggered only. Promotes the current tip of `main` (which must
 # be exactly at a release tag) into github.com/luciditycloud/terraform-provider-lucidity's
 # `main`, rewriting the Go module path and provider Registry address from
-# Devaansh/lucidity to luciditycloud/lucidity along the way, and pushes a
+# luciditycloud/lucidity to luciditycloud/lucidity along the way, and pushes a
 # matching tag so luciditycloud's own release.yml cuts a signed release
 # there. See RELEASING.md's "Promoting to the official stable repo"
 # section for the one-time prerequisites (LUCIDITYCLOUD_PUSH_TOKEN secret,
@@ -15,9 +15,9 @@ permissions:
   contents: read
 
 env:
-  OLD_MODULE: github.com/Devaansh/terraform-provider-lucidity
+  OLD_MODULE: github.com/luciditycloud/terraform-provider-lucidity
   NEW_MODULE: github.com/luciditycloud/terraform-provider-lucidity
-  OLD_NS: Devaansh/lucidity
+  OLD_NS: luciditycloud/lucidity
   NEW_NS: luciditycloud/lucidity
   STABLE_REPO_URL: https://github.com/luciditycloud/terraform-provider-lucidity.git
 
