@@ -9,6 +9,28 @@ once it reaches a stable release cadence.
 
 ## [Unreleased]
 
+_Author: Swapnesh Kumar._
+
+### Added
+
+- `lucidity_temp_buffer` resource: requests a temporary storage buffer on a
+  Lucidity-managed instance (AWS, Azure, GCP) and waits until it is ACTIVE
+  (polls every 30s, up to 30 minutes); destroy revokes it. Nothing is
+  updatable in place. A buffer that ends FAILED or times out is kept in
+  state as tainted so it can still be revoked. Import by buffer ID.
+- `lucidity_temp_buffer` data source: reads a buffer's status by buffer ID.
+- A `request_id` is always sent with the buffer request (generated as
+  `terraform-<uuid>` if not set), so a 5xx is retried with the same ID —
+  Lucidity documents it as the deduplication key.
+
+### Changed
+
+- Responses without the `{success,data,error,requestId}` envelope are now
+  decoded directly, and flat `{code,message,details}` error bodies are
+  parsed (code, message and details shown) instead of reported as
+  `UNKNOWN`. The temporary buffer and refresh-token docs specify these
+  shapes; enveloped responses behave as before.
+
 ## [0.1.7] - 2026-10-10
 
 _Author: Devaansh Goenka._
