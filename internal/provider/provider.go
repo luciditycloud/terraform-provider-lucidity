@@ -1,6 +1,7 @@
 // Package provider implements the Lucidity Terraform provider: Phase 1's
-// authentication layer, plus Phase 2's lucidity_tenant resource and
-// lucidity_tenants data source.
+// authentication layer, Phase 2's lucidity_tenant resource and
+// lucidity_tenants data source, and the lucidity_temp_buffer resource and
+// data source.
 package provider
 
 import (
@@ -185,11 +186,13 @@ func (p *LucidityProvider) Configure(ctx context.Context, req provider.Configure
 func (p *LucidityProvider) Resources(_ context.Context) []func() resource.Resource {
 	return []func() resource.Resource{
 		newTenantResource,
+		newTempBufferResource,
 	}
 }
 
 func (p *LucidityProvider) DataSources(_ context.Context) []func() datasource.DataSource {
 	return []func() datasource.DataSource{
 		newTenantsDataSource,
+		newTempBufferDataSource,
 	}
 }

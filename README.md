@@ -49,7 +49,7 @@ boundaries. QA test and logs are organized the same way — see
 | Lucidity agent installation and status validation | Phase 4 | Not yet implemented | Not yet implemented | Not yet implemented |
 | Onboarding and Disk management | Phase 4 | Not yet implemented | Not yet implemented | Not yet implemented |
 | Lucidity Buffer policy management | Phase 3 | Not yet implemented | Not yet implemented | Not yet implemented |
-| Lucidity Temporary buffer management | Phase 3 | Not yet implemented | Not yet implemented | Not yet implemented |
+| Lucidity Temporary buffer management | Phase 3 | In development (not live-tested) | In development (not live-tested) | In development (not live-tested) |
 
 
 ## Documents
@@ -85,6 +85,17 @@ tfplugindocs generate --provider-name lucidity
 3. Click on "API Key"
 4. Click on "Create Key" to generate a refresh token
 5. Supply the refresh token to this provider
+
+**API documentation notes (authentication).** Differences between Lucidity's
+API docs ([apidocs/legacy/auth.md](apidocs/legacy/auth.md)) and this
+provider, and gaps the docs reveal:
+
+| Topic | API docs | This provider | Impact |
+|---|---|---|---|
+| Where the refresh token comes from | Getting Started: an Admin generates it under Users → their own entry → Generate New Key. API reference: "issued by Lucidity CS". | The steps above (Settings → API Key) | The API docs are marked "stale" on the docs site; the steps above may reflect a newer dashboard. Use whichever your dashboard shows. |
+| Who can create a token | Admins only, and only for their own account | — | Every automation runs as one named Admin. If that person leaves or loses the Admin role, the token stops working. Machine credentials (service accounts or OIDC) are needed from Lucidity's API to fix this. |
+| Token lifetime | Refresh token 30 days by default; access token 15 minutes | Renews the access token 3 minutes early; never stores either token | Rotate the refresh token before 30 days. |
+| Error format | Refresh errors are a flat `{code, message, details}`; other endpoints wrap errors in `{success, data, error, requestId}` | Accepts both formats and shows `details` when present | None. |
 
 The provider takes the refresh token via (exactly one) of the following:
 1. `refresh_token` (to pull from a data source)
@@ -370,6 +381,123 @@ normal update on the next `apply`.
 
 Full test evidence: [docs/qa-testing/account-management.md](docs/qa-testing/account-management.md).
 Full schema reference: [docs/resources/tenant.md](docs/resources/tenant.md), [docs/data-sources/tenants.md](docs/data-sources/tenants.md).
+
+
+## Lucidity Temporary Buffer Management
+
+Adds temporary free space to a Lucidity-managed instance for an operation
+that needs it — typically a database restore or a data migration — without
+changing the instance's scaling policy. Two objects: the
+`lucidity_temp_buffer` resource and the `lucidity_temp_buffer` data source.
+
+```hcl
+resource "lucidity_temp_buffer" "orders_db_restore" {
+  instance_identifier {
+    cloud_provider            = "AWS"
+    cloud_provider_account_id = "123456789012"
+    instance_id               = "i-0abcd1234efgh5678"
+  }
+
+  request_buffer_size_in_gib = 50
+}
+```
+
+| Step | What the provider does |
+|---|---|
+| `terraform apply` | Requests the buffer, then polls its status every 30s until ACTIVE (up to 30 minutes) |
+| Restore runs | Outside Terraform, once apply has finished |
+| `terraform destroy` / remove the block | Revokes the buffer; the instance returns to its original scaling policy |
+
+### Known behavior worth knowing
+
+- **A buffer costs money until it is revoked.** Lucidity does not revoke it
+  automatically. Remove the resource (or use `count` on a variable) once the
+  operation is done.
+- **Only one buffer per instance.** A second request for the same instance
+  fails with a conflict.
+- **Changing the size or the instance replaces the buffer** (revoke, then a
+  new request). See "Why changes replace the buffer" below. Don't change
+  them while a restore depends on the buffer, and don't use
+  `create_before_destroy` on this resource.
+- **Changing `request_id`** only updates state; the existing buffer is left
+  alone.
+- **Azure** needs `resource_group`, and `instance_id` may be the VM name.
+- **A request is never duplicated on retry.** A `request_id` is always sent
+  (generated if you don't set one), so a retried request after a server
+  error is deduplicated by Lucidity.
+- **A buffer that ends FAILED, or is still PROVISIONING after 30 minutes,**
+  fails the apply but stays in state as tainted, so the next apply (or a
+  destroy) revokes it instead of leaving it to bill.
+- **A buffer revoked outside Terraform** is dropped from state on the next
+  refresh; the next apply requests a new one if the resource is still in
+  your configuration.
+- **Import** takes the buffer ID: `terraform import lucidity_temp_buffer.<name> <buffer-id>`.
+  The instance ID is read back; the other inputs are assumed to match your
+  configuration.
+
+### Keeping the buffer ID
+
+Lucidity returns a buffer's ID **only once**, in the response to the request
+call, and has no way to look it up afterwards (no list, no search by
+instance or request ID). Every later call (status, revoke, import) needs it.
+The provider handles this as follows:
+
+- **It saves the ID to Terraform state** as soon as Lucidity returns it,
+  before waiting for ACTIVE. Even if the wait fails, destroy can still
+  revoke it.
+- **It recovers a lost response.** If the request reaches Lucidity but the
+  response doesn't come back (timeout, dropped connection, server error),
+  the provider re-sends the same request with the same `request_id`.
+  Lucidity documents `request_id` as its deduplication key, so this returns
+  the same buffer rather than creating a second one.
+- **Use a stable `request_id`** (e.g. `restore-orders-db-2026-10-23`)
+  rather than letting the provider generate one. If an apply fails after
+  Lucidity received the request, re-applying with the same `request_id` gets
+  the same buffer back. With a generated ID, it would fail with a conflict
+  instead.
+- **Expose it as an output** if anything outside this configuration needs
+  it, for example a restore script or a later `terraform import`:
+
+  ```hcl
+  output "restore_buffer_id" {
+    value = lucidity_temp_buffer.orders_db_restore.buffer_id
+  }
+  ```
+
+### Why changes replace the buffer
+
+Lucidity's temporary buffer API has three calls: request, check status and
+revoke. **There is no call to resize or modify an existing buffer**, so the
+only way to apply a new size is to revoke the old buffer and request a new
+one. Terraform shows this as a replacement in `plan`.
+
+- **What the provider does to make replacement safe:** destroy waits until
+  the old buffer reads REVOKED (up to 10 minutes) before the new one is
+  requested, because Lucidity allows one buffer per instance.
+- **What it can't avoid:** between the revoke and the new buffer becoming
+  ACTIVE, the instance has no buffer.
+- **A true in-place resize needs a new API call from Lucidity.**
+
+### API documentation notes (temporary buffer)
+
+Differences between Lucidity's API docs
+([apidocs/legacy/temp-buffer/temp-buffer.md](apidocs/legacy/temp-buffer/temp-buffer.md))
+and this provider that affect users:
+
+| Topic | API docs | This provider |
+|---|---|---|
+| Resize or modify | No call exists | Replacement (above) |
+| Find a buffer later | No list or lookup; the ID is returned once | Saves it to state; recovers a lost response by `request_id` (above) |
+| Automatic revoke | None: "the buffer will continue incurring costs until manually revoked" | None either. Remove the resource when done. |
+| Cancel a request | Not possible: wait for ACTIVE or FAILED, then revoke | Destroy during PROVISIONING waits, then revokes |
+| Revoking a FAILED buffer | Not described | Tries to revoke; if that fails, warns and drops it from state |
+| Response format | Bare JSON (`{"bufferId": ...}`); errors as `{code, message, details}` | Accepts both bare and wrapped responses |
+| Error codes | Only HTTP statuses are documented (400, 401, 404, 409) | Errors are recognised by status |
+| Size limits | "Typically 1 GB to 1 TB", varying by cloud and instance type | Only checks the size is at least 1 GiB |
+| Rate limit | 50 requests per minute | No limiter; at most 10 calls at once, and status is polled every 30s. Many buffers in one apply could hit the limit. |
+| Status fields | Instance ID, status, free space, failure reason; not cloud, account, resource group or size | After import, those inputs are assumed from your configuration |
+
+Full schema reference: [docs/resources/temp_buffer.md](docs/resources/temp_buffer.md), [docs/data-sources/temp_buffer.md](docs/data-sources/temp_buffer.md).
 
 
 ## Future planned improvements
