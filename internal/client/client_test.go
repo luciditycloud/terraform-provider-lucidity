@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -302,5 +303,35 @@ func TestClient_DoRespectsContextCancellationWhileWaitingForSemaphore(t *testing
 
 	if err := <-firstDone; err != nil {
 		t.Fatalf("first Do call: %v", err)
+	}
+}
+
+// The refresh endpoint (and the temporary buffer endpoints) document a flat
+// error body; its code must be recognized instead of falling back to UNKNOWN.
+func TestParseErrorBody_FlatShape(t *testing.T) {
+	err := parseErrorBody(http.StatusBadRequest, []byte(`{"code":"INVALID_REQUEST","message":"refreshToken is required","details":null}`))
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.Code != "INVALID_REQUEST" || apiErr.Message != "refreshToken is required" || apiErr.Details != "" {
+		t.Fatalf("got %+v, want INVALID_REQUEST with no details", err)
+	}
+
+	err = parseErrorBody(http.StatusConflict, []byte(`{"code":"CONFLICT","message":"busy","details":{"id":"x-1"}}`))
+	if !errors.As(err, &apiErr) || !strings.Contains(apiErr.Error(), "x-1") {
+		t.Fatalf("got %v, want details shown in the error", err)
+	}
+}
+
+// A body without the envelope's "success" key is decoded directly; an
+// enveloped body still decodes its "data".
+func TestDecodeEnvelope_BareAndWrapped(t *testing.T) {
+	var out struct {
+		ID string `json:"id"`
+	}
+	if err := decodeEnvelope([]byte(`{"id":"bare"}`), &out); err != nil || out.ID != "bare" {
+		t.Fatalf("bare: got %+v, %v", out, err)
+	}
+	out.ID = ""
+	if err := decodeEnvelope([]byte(`{"success":true,"data":{"id":"wrapped"},"error":null,"requestId":"r"}`), &out); err != nil || out.ID != "wrapped" {
+		t.Fatalf("wrapped: got %+v, %v", out, err)
 	}
 }

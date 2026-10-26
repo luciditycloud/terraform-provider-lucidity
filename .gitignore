@@ -5,3 +5,6 @@
 *.tfstate.*
 .terraform/
 .terraform.lock.hcl
+
+# Personal solutioning notes (not for commit)
+/sa-notes/
