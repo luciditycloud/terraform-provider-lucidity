@@ -36,6 +36,15 @@ type envelopeError struct {
 	Message string `json:"message"`
 }
 
+// flatError is the unwrapped {code,message,details} error shape the API docs
+// specify for the refresh and temporary buffer endpoints, as opposed to the
+// envelope's nested error object.
+type flatError struct {
+	Code    string          `json:"code"`
+	Message string          `json:"message"`
+	Details json.RawMessage `json:"details"`
+}
+
 // APIError is a parsed Lucidity API error, carrying the requestId needed for
 // support escalation.
 type APIError struct {
@@ -43,13 +52,19 @@ type APIError struct {
 	Code       string
 	Message    string
 	RequestID  string
+	// Details is the raw "details" object from a flat error body, if any.
+	Details string
 }
 
 func (e *APIError) Error() string {
-	if e.RequestID != "" {
-		return fmt.Sprintf("lucidity API error [%s]: %s (requestId=%s)", e.Code, e.Message, e.RequestID)
+	msg := fmt.Sprintf("lucidity API error [%s]: %s", e.Code, e.Message)
+	if e.Details != "" {
+		msg += fmt.Sprintf(" (details=%s)", e.Details)
 	}
-	return fmt.Sprintf("lucidity API error [%s]: %s", e.Code, e.Message)
+	if e.RequestID != "" {
+		msg += fmt.Sprintf(" (requestId=%s)", e.RequestID)
+	}
+	return msg
 }
 
 func parseErrorBody(status int, body []byte) error {
@@ -61,6 +76,18 @@ func parseErrorBody(status int, body []byte) error {
 			Message:    env.Error.Message,
 			RequestID:  env.RequestID,
 		}
+	}
+	var flat flatError
+	if err := json.Unmarshal(body, &flat); err == nil && (flat.Code != "" || flat.Message != "") {
+		apiErr := &APIError{
+			HTTPStatus: status,
+			Code:       flat.Code,
+			Message:    flat.Message,
+		}
+		if d := strings.TrimSpace(string(flat.Details)); d != "" && d != "null" && d != "{}" {
+			apiErr.Details = truncate(d, 500)
+		}
+		return apiErr
 	}
 	// Render unmapped/unparseable bodies generically but completely
 	// (CONFLICT semantics in particular are unconfirmed upstream).
@@ -348,9 +375,22 @@ func (c *Client) doOnce(ctx context.Context, method, path string, bodyBytes []by
 	return resp.StatusCode, respBody, nil
 }
 
+// decodeEnvelope decodes a success response into out. Most endpoints wrap
+// their payload in the {success,data,error,requestId} envelope, but the
+// temporary buffer docs show bare objects (e.g. {"bufferId": "..."}), so a
+// body without a "success" key is decoded directly into out.
 func decodeEnvelope(body []byte, out any) error {
 	if out == nil {
 		return nil
+	}
+	var probe map[string]json.RawMessage
+	if err := json.Unmarshal(body, &probe); err == nil {
+		if _, wrapped := probe["success"]; !wrapped {
+			if err := json.Unmarshal(body, out); err != nil {
+				return fmt.Errorf("lucidity: decoding response: %w", err)
+			}
+			return nil
+		}
 	}
 	var env envelope
 	if err := json.Unmarshal(body, &env); err != nil {

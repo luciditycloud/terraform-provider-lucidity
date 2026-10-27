@@ -9,6 +9,16 @@ once it reaches a stable release cadence.
 
 ## [Unreleased]
 
+_Author: Swapnesh Kumar._
+
+### Changed
+
+- Responses without the `{success,data,error,requestId}` envelope are now
+  decoded directly, and flat `{code,message,details}` error bodies are
+  parsed (code, message and details shown) instead of reported as
+  `UNKNOWN`. The refresh-token and temporary buffer API docs specify these
+  shapes; enveloped responses behave as before.
+
 ## [0.1.7] - 2026-10-10
 
 _Author: Devaansh Goenka._
